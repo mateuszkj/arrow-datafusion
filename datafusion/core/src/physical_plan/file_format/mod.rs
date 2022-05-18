@@ -28,7 +28,7 @@ pub use self::parquet::ParquetExec;
 use arrow::{
     array::{ArrayData, ArrayRef, DictionaryArray},
     buffer::Buffer,
-    datatypes::{DataType, Field, Schema, SchemaRef, UInt16Type},
+    datatypes::{DataType, Field, Schema, SchemaRef, UInt32Type},
     error::{ArrowError, Result as ArrowResult},
     record_batch::RecordBatch,
 };
@@ -43,7 +43,7 @@ use crate::{
     error::{DataFusionError, Result},
     scalar::ScalarValue,
 };
-use arrow::array::{new_null_array, UInt16BufferBuilder};
+use arrow::array::{new_null_array, UInt32BufferBuilder};
 use arrow::record_batch::RecordBatchOptions;
 use datafusion_data_access::object_store::ObjectStore;
 use lazy_static::lazy_static;
@@ -59,7 +59,7 @@ use super::{ColumnStatistics, Statistics};
 
 lazy_static! {
     /// The datatype used for all partitioning columns for now
-    pub static ref DEFAULT_PARTITION_COLUMN_DATATYPE: DataType = DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8));
+    pub static ref DEFAULT_PARTITION_COLUMN_DATATYPE: DataType = DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8));
 }
 
 /// The base configurations to provide when creating a physical plan for
@@ -373,17 +373,17 @@ fn create_dict_array(
 
     // build keys array
     let sliced_key_buffer = match key_buffer_cache {
-        Some(buf) if buf.len() >= len * 2 => buf.slice(buf.len() - len * 2),
+        Some(buf) if buf.len() >= len * 4 => buf.slice(buf.len() - len * 4),
         _ => {
-            let mut key_buffer_builder = UInt16BufferBuilder::new(len * 2);
-            key_buffer_builder.advance(len * 2); // keys are all 0
+            let mut key_buffer_builder = UInt32BufferBuilder::new(len * 4);
+            key_buffer_builder.advance(len * 4); // keys are all 0
             key_buffer_cache.insert(key_buffer_builder.finish()).clone()
         }
     };
 
     // create data type
     let data_type =
-        DataType::Dictionary(Box::new(DataType::UInt16), Box::new(val.get_datatype()));
+        DataType::Dictionary(Box::new(DataType::UInt32), Box::new(val.get_datatype()));
 
     debug_assert_eq!(data_type, *DEFAULT_PARTITION_COLUMN_DATATYPE);
 
@@ -392,7 +392,7 @@ fn create_dict_array(
         .len(len)
         .add_buffer(sliced_key_buffer);
     builder = builder.add_child_data(dict_vals.data().clone());
-    Arc::new(DictionaryArray::<UInt16Type>::from(
+    Arc::new(DictionaryArray::<UInt32Type>::from(
         builder.build().unwrap(),
     ))
 }
