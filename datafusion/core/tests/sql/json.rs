@@ -72,6 +72,7 @@ async fn json_single_nan_schema() {
 }
 
 #[tokio::test]
+#[cfg_attr(tarpaulin, ignore)]
 async fn json_explain() {
     let ctx = SessionContext::new();
     let path = format!("{}/2.json", TEST_DATA_BASE);
@@ -87,7 +88,7 @@ async fn json_explain() {
             "logical_plan",
             "Projection: #COUNT(UInt8(1))\
             \n  Aggregate: groupBy=[[]], aggr=[[COUNT(UInt8(1))]]\
-            \n    TableScan: t1 projection=Some([0])",
+            \n    TableScan: t1 projection=Some([a])",
         ],
         vec![
             "physical_plan",
@@ -96,7 +97,7 @@ async fn json_explain() {
             \n    CoalescePartitionsExec\
             \n      AggregateExec: mode=Partial, gby=[], aggr=[COUNT(UInt8(1))]\
             \n        RepartitionExec: partitioning=RoundRobinBatch(NUM_CORES)\
-            \n          JsonExec: limit=None, files=[tests/jsons/2.json]\n",
+            \n          JsonExec: limit=None, files=[WORKING_DIR/tests/jsons/2.json]\n",
         ],
     ];
     assert_eq!(expected, actual);

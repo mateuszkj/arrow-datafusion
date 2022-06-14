@@ -71,12 +71,12 @@ async fn explain_analyze_baseline_metrics() {
     );
     assert_metrics!(
         &formatted,
-        "GlobalLimitExec: limit=3, ",
+        "GlobalLimitExec: skip=None, fetch=3, ",
         "metrics=[output_rows=1, elapsed_compute="
     );
     assert_metrics!(
         &formatted,
-        "LocalLimitExec: limit=3",
+        "LocalLimitExec: fetch=3",
         "metrics=[output_rows=3, elapsed_compute="
     );
     assert_metrics!(
@@ -269,7 +269,7 @@ async fn csv_explain_plans() {
         "Explain [plan_type:Utf8, plan:Utf8]",
         "  Projection: #aggregate_test_100.c1 [c1:Utf8]",
         "    Filter: #aggregate_test_100.c2 > Int64(10) [c1:Utf8, c2:Int32]",
-        "      TableScan: aggregate_test_100 projection=Some([0, 1]), partial_filters=[#aggregate_test_100.c2 > Int64(10)] [c1:Utf8, c2:Int32]",
+        "      TableScan: aggregate_test_100 projection=Some([c1, c2]), partial_filters=[#aggregate_test_100.c2 > Int64(10)] [c1:Utf8, c2:Int32]",
     ];
     let formatted = plan.display_indent_schema().to_string();
     let actual: Vec<&str> = formatted.trim().lines().collect();
@@ -284,7 +284,7 @@ async fn csv_explain_plans() {
         "Explain",
         "  Projection: #aggregate_test_100.c1",
         "    Filter: #aggregate_test_100.c2 > Int64(10)",
-        "      TableScan: aggregate_test_100 projection=Some([0, 1]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]",
+        "      TableScan: aggregate_test_100 projection=Some([c1, c2]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]",
     ];
     let formatted = plan.display_indent().to_string();
     let actual: Vec<&str> = formatted.trim().lines().collect();
@@ -306,7 +306,7 @@ async fn csv_explain_plans() {
         "    2 -> 3 [arrowhead=none, arrowtail=normal, dir=back]",
         "    4[shape=box label=\"Filter: #aggregate_test_100.c2 > Int64(10)\"]",
         "    3 -> 4 [arrowhead=none, arrowtail=normal, dir=back]",
-        "    5[shape=box label=\"TableScan: aggregate_test_100 projection=Some([0, 1]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]\"]",
+        "    5[shape=box label=\"TableScan: aggregate_test_100 projection=Some([c1, c2]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]\"]",
         "    4 -> 5 [arrowhead=none, arrowtail=normal, dir=back]",
         "  }",
         "  subgraph cluster_6",
@@ -317,7 +317,7 @@ async fn csv_explain_plans() {
         "    7 -> 8 [arrowhead=none, arrowtail=normal, dir=back]",
         "    9[shape=box label=\"Filter: #aggregate_test_100.c2 > Int64(10)\\nSchema: [c1:Utf8, c2:Int32]\"]",
         "    8 -> 9 [arrowhead=none, arrowtail=normal, dir=back]",
-        "    10[shape=box label=\"TableScan: aggregate_test_100 projection=Some([0, 1]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]\\nSchema: [c1:Utf8, c2:Int32]\"]",
+        "    10[shape=box label=\"TableScan: aggregate_test_100 projection=Some([c1, c2]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]\\nSchema: [c1:Utf8, c2:Int32]\"]",
         "    9 -> 10 [arrowhead=none, arrowtail=normal, dir=back]",
         "  }",
         "}",
@@ -467,7 +467,7 @@ async fn csv_explain_verbose_plans() {
         "Explain [plan_type:Utf8, plan:Utf8]",
         "  Projection: #aggregate_test_100.c1 [c1:Utf8]",
         "    Filter: #aggregate_test_100.c2 > Int64(10) [c1:Utf8, c2:Int32]",
-        "      TableScan: aggregate_test_100 projection=Some([0, 1]), partial_filters=[#aggregate_test_100.c2 > Int64(10)] [c1:Utf8, c2:Int32]",
+        "      TableScan: aggregate_test_100 projection=Some([c1, c2]), partial_filters=[#aggregate_test_100.c2 > Int64(10)] [c1:Utf8, c2:Int32]",
     ];
     let formatted = plan.display_indent_schema().to_string();
     let actual: Vec<&str> = formatted.trim().lines().collect();
@@ -482,7 +482,7 @@ async fn csv_explain_verbose_plans() {
         "Explain",
         "  Projection: #aggregate_test_100.c1",
         "    Filter: #aggregate_test_100.c2 > Int64(10)",
-        "      TableScan: aggregate_test_100 projection=Some([0, 1]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]",
+        "      TableScan: aggregate_test_100 projection=Some([c1, c2]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]",
     ];
     let formatted = plan.display_indent().to_string();
     let actual: Vec<&str> = formatted.trim().lines().collect();
@@ -504,7 +504,7 @@ async fn csv_explain_verbose_plans() {
         "    2 -> 3 [arrowhead=none, arrowtail=normal, dir=back]",
         "    4[shape=box label=\"Filter: #aggregate_test_100.c2 > Int64(10)\"]",
         "    3 -> 4 [arrowhead=none, arrowtail=normal, dir=back]",
-        "    5[shape=box label=\"TableScan: aggregate_test_100 projection=Some([0, 1]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]\"]",
+        "    5[shape=box label=\"TableScan: aggregate_test_100 projection=Some([c1, c2]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]\"]",
         "    4 -> 5 [arrowhead=none, arrowtail=normal, dir=back]",
         "  }",
         "  subgraph cluster_6",
@@ -515,7 +515,7 @@ async fn csv_explain_verbose_plans() {
         "    7 -> 8 [arrowhead=none, arrowtail=normal, dir=back]",
         "    9[shape=box label=\"Filter: #aggregate_test_100.c2 > Int64(10)\\nSchema: [c1:Utf8, c2:Int32]\"]",
         "    8 -> 9 [arrowhead=none, arrowtail=normal, dir=back]",
-        "    10[shape=box label=\"TableScan: aggregate_test_100 projection=Some([0, 1]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]\\nSchema: [c1:Utf8, c2:Int32]\"]",
+        "    10[shape=box label=\"TableScan: aggregate_test_100 projection=Some([c1, c2]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]\\nSchema: [c1:Utf8, c2:Int32]\"]",
         "    9 -> 10 [arrowhead=none, arrowtail=normal, dir=back]",
         "  }",
         "}",
@@ -628,12 +628,12 @@ order by
     \n      Inner Join: #customer.c_nationkey = #nation.n_nationkey\
     \n        Inner Join: #orders.o_orderkey = #lineitem.l_orderkey\
     \n          Inner Join: #customer.c_custkey = #orders.o_custkey\
-    \n            TableScan: customer projection=Some([0, 1, 2, 3, 4, 5, 7])\
+    \n            TableScan: customer projection=Some([c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_comment])\
     \n            Filter: #orders.o_orderdate >= Date32(\"8674\") AND #orders.o_orderdate < Date32(\"8766\")\
-    \n              TableScan: orders projection=Some([0, 1, 4]), partial_filters=[#orders.o_orderdate >= Date32(\"8674\"), #orders.o_orderdate < Date32(\"8766\")]\
+    \n              TableScan: orders projection=Some([o_orderkey, o_custkey, o_orderdate]), partial_filters=[#orders.o_orderdate >= Date32(\"8674\"), #orders.o_orderdate < Date32(\"8766\")]\
     \n          Filter: #lineitem.l_returnflag = Utf8(\"R\")\
-    \n            TableScan: lineitem projection=Some([0, 5, 6, 8]), partial_filters=[#lineitem.l_returnflag = Utf8(\"R\")]\
-    \n        TableScan: nation projection=Some([0, 1])";
+    \n            TableScan: lineitem projection=Some([l_orderkey, l_extendedprice, l_discount, l_returnflag]), partial_filters=[#lineitem.l_returnflag = Utf8(\"R\")]\
+    \n        TableScan: nation projection=Some([n_nationkey, n_name])";
     assert_eq!(format!("{:?}", plan.unwrap()), expected);
 
     Ok(())
@@ -642,7 +642,7 @@ order by
 #[tokio::test]
 async fn test_physical_plan_display_indent() {
     // Hard code target_partitions as it appears in the RepartitionExec output
-    let config = SessionConfig::new().with_target_partitions(3);
+    let config = SessionConfig::new().with_target_partitions(9000);
     let ctx = SessionContext::with_config(config);
     register_aggregate_csv(&ctx).await.unwrap();
     let sql = "SELECT c1, MAX(c12), MIN(c12) as the_min \
@@ -656,28 +656,27 @@ async fn test_physical_plan_display_indent() {
 
     let physical_plan = ctx.create_physical_plan(&plan).await.unwrap();
     let expected = vec![
-        "GlobalLimitExec: limit=10",
+        "GlobalLimitExec: skip=None, fetch=10",
         "  SortExec: [the_min@2 DESC]",
         "    CoalescePartitionsExec",
         "      ProjectionExec: expr=[c1@0 as c1, MAX(aggregate_test_100.c12)@1 as MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)@2 as the_min]",
         "        AggregateExec: mode=FinalPartitioned, gby=[c1@0 as c1], aggr=[MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)]",
         "          CoalesceBatchesExec: target_batch_size=4096",
-        "            RepartitionExec: partitioning=Hash([Column { name: \"c1\", index: 0 }], 3)",
+        "            RepartitionExec: partitioning=Hash([Column { name: \"c1\", index: 0 }], 9000)",
         "              AggregateExec: mode=Partial, gby=[c1@0 as c1], aggr=[MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)]",
         "                CoalesceBatchesExec: target_batch_size=4096",
         "                  FilterExec: c12@1 < CAST(10 AS Float64)",
-        "                    RepartitionExec: partitioning=RoundRobinBatch(3)",
+        "                    RepartitionExec: partitioning=RoundRobinBatch(9000)",
         "                      CsvExec: files=[ARROW_TEST_DATA/csv/aggregate_test_100.csv], has_header=true, limit=None, projection=[c1, c12]",
     ];
 
-    let data_path = datafusion::test_util::arrow_test_data();
+    let normalizer = ExplainNormalizer::new();
     let actual = format!("{}", displayable(physical_plan.as_ref()).indent())
         .trim()
         .lines()
         // normalize paths
-        .map(|s| s.replace(&data_path, "ARROW_TEST_DATA"))
+        .map(|s| normalizer.normalize(s))
         .collect::<Vec<_>>();
-
     assert_eq!(
         expected, actual,
         "expected:\n{:#?}\nactual:\n\n{:#?}\n",
@@ -688,7 +687,7 @@ async fn test_physical_plan_display_indent() {
 #[tokio::test]
 async fn test_physical_plan_display_indent_multi_children() {
     // Hard code target_partitions as it appears in the RepartitionExec output
-    let config = SessionConfig::new().with_target_partitions(3);
+    let config = SessionConfig::new().with_target_partitions(9000);
     let ctx = SessionContext::with_config(config);
     // ensure indenting works for nodes with multiple children
     register_aggregate_csv(&ctx).await.unwrap();
@@ -708,25 +707,25 @@ async fn test_physical_plan_display_indent_multi_children() {
         "  CoalesceBatchesExec: target_batch_size=4096",
         "    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(Column { name: \"c1\", index: 0 }, Column { name: \"c2\", index: 0 })]",
         "      CoalesceBatchesExec: target_batch_size=4096",
-        "        RepartitionExec: partitioning=Hash([Column { name: \"c1\", index: 0 }], 3)",
+        "        RepartitionExec: partitioning=Hash([Column { name: \"c1\", index: 0 }], 9000)",
         "          ProjectionExec: expr=[c1@0 as c1]",
         "            ProjectionExec: expr=[c1@0 as c1]",
-        "              RepartitionExec: partitioning=RoundRobinBatch(3)",
+        "              RepartitionExec: partitioning=RoundRobinBatch(9000)",
         "                CsvExec: files=[ARROW_TEST_DATA/csv/aggregate_test_100.csv], has_header=true, limit=None, projection=[c1]",
         "      CoalesceBatchesExec: target_batch_size=4096",
-        "        RepartitionExec: partitioning=Hash([Column { name: \"c2\", index: 0 }], 3)",
+        "        RepartitionExec: partitioning=Hash([Column { name: \"c2\", index: 0 }], 9000)",
         "          ProjectionExec: expr=[c2@0 as c2]",
         "            ProjectionExec: expr=[c1@0 as c2]",
-        "              RepartitionExec: partitioning=RoundRobinBatch(3)",
+        "              RepartitionExec: partitioning=RoundRobinBatch(9000)",
         "                CsvExec: files=[ARROW_TEST_DATA/csv/aggregate_test_100.csv], has_header=true, limit=None, projection=[c1]",
     ];
 
-    let data_path = datafusion::test_util::arrow_test_data();
+    let normalizer = ExplainNormalizer::new();
     let actual = format!("{}", displayable(physical_plan.as_ref()).indent())
         .trim()
         .lines()
         // normalize paths
-        .map(|s| s.replace(&data_path, "ARROW_TEST_DATA"))
+        .map(|s| normalizer.normalize(s))
         .collect::<Vec<_>>();
 
     assert_eq!(
@@ -737,6 +736,7 @@ async fn test_physical_plan_display_indent_multi_children() {
 }
 
 #[tokio::test]
+#[cfg_attr(tarpaulin, ignore)]
 async fn csv_explain() {
     // This test uses the execute function that create full plan cycle: logical, optimized logical, and physical,
     // then execute the physical plan and return the final explain results
@@ -753,7 +753,7 @@ async fn csv_explain() {
             "logical_plan",
             "Projection: #aggregate_test_100.c1\
              \n  Filter: #aggregate_test_100.c2 > Int64(10)\
-             \n    TableScan: aggregate_test_100 projection=Some([0, 1]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]"
+             \n    TableScan: aggregate_test_100 projection=Some([c1, c2]), partial_filters=[#aggregate_test_100.c2 > Int64(10)]"
         ],
         vec!["physical_plan",
              "ProjectionExec: expr=[c1@0 as c1]\
@@ -773,6 +773,7 @@ async fn csv_explain() {
 }
 
 #[tokio::test]
+#[cfg_attr(tarpaulin, ignore)]
 async fn csv_explain_analyze() {
     // This test uses the execute function to run an actual plan under EXPLAIN ANALYZE
     let ctx = SessionContext::new();
@@ -794,6 +795,7 @@ async fn csv_explain_analyze() {
 }
 
 #[tokio::test]
+#[cfg_attr(tarpaulin, ignore)]
 async fn csv_explain_analyze_verbose() {
     // This test uses the execute function to run an actual plan under EXPLAIN VERBOSE ANALYZE
     let ctx = SessionContext::new();

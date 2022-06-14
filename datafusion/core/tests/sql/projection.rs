@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::logical_plan::{LogicalPlanBuilder, UNNAMED_TABLE};
+use datafusion::logical_plan::{provider_as_source, LogicalPlanBuilder, UNNAMED_TABLE};
+use datafusion::test_util::scan_empty;
 use tempfile::TempDir;
 
 use super::*;
@@ -187,7 +188,7 @@ async fn projection_on_table_scan() -> Result<()> {
     }
 
     let expected = "Projection: #test.c2\
-                    \n  TableScan: test projection=Some([1])";
+                    \n  TableScan: test projection=Some([c2])";
     assert_eq!(format!("{:?}", optimized_plan), expected);
 
     let physical_plan = ctx.create_physical_plan(&optimized_plan).await?;
@@ -209,7 +210,7 @@ async fn preserve_nullability_on_projection() -> Result<()> {
     let schema: Schema = ctx.table("test").unwrap().schema().clone().into();
     assert!(!schema.field_with_name("c1")?.is_nullable());
 
-    let plan = LogicalPlanBuilder::scan_empty(None, &schema, None)?
+    let plan = scan_empty(None, &schema, None)?
         .project(vec![col("c1")])?
         .build()?;
 
@@ -238,9 +239,10 @@ async fn projection_on_memory_scan() -> Result<()> {
     )?]];
 
     let provider = Arc::new(MemTable::try_new(schema, partitions)?);
-    let plan = LogicalPlanBuilder::scan(UNNAMED_TABLE, provider, None)?
-        .project(vec![col("b")])?
-        .build()?;
+    let plan =
+        LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(provider), None)?
+            .project(vec![col("b")])?
+            .build()?;
     assert_fields_eq(&plan, vec!["b"]);
 
     let ctx = SessionContext::new();
@@ -262,7 +264,7 @@ async fn projection_on_memory_scan() -> Result<()> {
 
     let expected = format!(
         "Projection: #{}.b\
-         \n  TableScan: {} projection=Some([1])",
+         \n  TableScan: {} projection=Some([b])",
         UNNAMED_TABLE, UNNAMED_TABLE
     );
     assert_eq!(format!("{:?}", optimized_plan), expected);

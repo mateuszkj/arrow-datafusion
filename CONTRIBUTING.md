@@ -35,9 +35,6 @@ list to help you get started.
 
 This section describes how you can get started at developing DataFusion.
 
-For information on developing with Ballista, see the
-[Ballista developer documentation](ballista/docs/README.md).
-
 ### Bootstrap environment
 
 DataFusion is written in Rust and it uses a standard rust toolkit:
@@ -85,7 +82,7 @@ You can run these tests individually using a command such as
 cargo test -p datafusion --tests sql_integration
 ```
 
-One very important test is the [sql_integraton](https://github.com/apache/arrow-datafusion/blob/master/datafusion/tests/sql_integration.rs) test which validates DataFusion's ability to run a large assortment of SQL queries against an assortment of data setsups.
+One very important test is the [sql_integration](https://github.com/apache/arrow-datafusion/blob/master/datafusion/tests/sql_integration.rs) test which validates DataFusion's ability to run a large assortment of SQL queries against an assortment of data setups.
 
 ### SQL / Postgres Integration Tests
 
@@ -168,7 +165,7 @@ The benchmark will automatically remove any generated parquet file on exit, howe
 
 ### Upstream Benchmark Suites
 
-Instructions and tooling for running upstream benchmark suites against DataFusion and/or Ballista can be found in [benchmarks](./benchmarks).
+Instructions and tooling for running upstream benchmark suites against DataFusion can be found in [benchmarks](./benchmarks).
 
 These are valuable for comparative evaluation against alternative Arrow implementations and query engines.
 
@@ -263,5 +260,5 @@ $ prettier --version
 After you've confirmed your prettier version, you can format all the `.md` files:
 
 ```bash
-prettier -w {ballista,datafusion,datafusion-cli,datafusion-examples,dev,docs}/**/*.md
+prettier -w {datafusion,datafusion-cli,datafusion-examples,dev,docs}/**/*.md
 ```

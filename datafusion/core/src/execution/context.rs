@@ -33,14 +33,16 @@ use crate::{
         MemTable, ViewTable,
     },
     logical_plan::{PlanType, ToStringifiedPlan},
-    optimizer::eliminate_filter::EliminateFilter,
-    optimizer::eliminate_limit::EliminateLimit,
+    optimizer::{
+        eliminate_filter::EliminateFilter, eliminate_limit::EliminateLimit,
+        optimizer::Optimizer,
+    },
     physical_optimizer::{
         aggregate_statistics::AggregateStatistics,
         hash_build_probe_order::HashBuildProbeOrder, optimizer::PhysicalOptimizerRule,
     },
 };
-use log::{debug, trace};
+pub use datafusion_physical_expr::execution_props::ExecutionProps;
 use parking_lot::RwLock;
 use std::string::String;
 use std::sync::Arc;
@@ -54,25 +56,25 @@ use arrow::datatypes::{DataType, SchemaRef};
 use crate::catalog::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     schema::{MemorySchemaProvider, SchemaProvider},
-    ResolvedTableReference, TableReference,
 };
 use crate::dataframe::DataFrame;
-use crate::datasource::listing::ListingTableConfig;
+use crate::datasource::listing::{ListingTableConfig, ListingTableUrl};
 use crate::datasource::TableProvider;
 use crate::error::{DataFusionError, Result};
 use crate::logical_plan::{
-    CreateCatalog, CreateCatalogSchema, CreateExternalTable, CreateMemoryTable,
-    CreateView, DropTable, FileType, FunctionRegistry, LogicalPlan, LogicalPlanBuilder,
-    UNNAMED_TABLE,
+    provider_as_source, CreateCatalog, CreateCatalogSchema, CreateExternalTable,
+    CreateMemoryTable, CreateView, DropTable, FileType, FunctionRegistry, LogicalPlan,
+    LogicalPlanBuilder, UNNAMED_TABLE,
 };
 use crate::optimizer::common_subexpr_eliminate::CommonSubexprEliminate;
 use crate::optimizer::filter_push_down::FilterPushDown;
 use crate::optimizer::limit_push_down::LimitPushDown;
-use crate::optimizer::optimizer::OptimizerRule;
+use crate::optimizer::optimizer::{OptimizerConfig, OptimizerRule};
 use crate::optimizer::projection_push_down::ProjectionPushDown;
 use crate::optimizer::simplify_expressions::SimplifyExpressions;
 use crate::optimizer::single_distinct_to_groupby::SingleDistinctToGroupBy;
 use crate::optimizer::subquery_filter_to_join::SubqueryFilterToJoin;
+use datafusion_sql::{ResolvedTableReference, TableReference};
 
 use crate::physical_optimizer::coalesce_batches::CoalesceBatches;
 use crate::physical_optimizer::merge_exec::AddCoalescePartitionsExec;
@@ -86,13 +88,14 @@ use crate::physical_plan::udaf::AggregateUDF;
 use crate::physical_plan::udf::ScalarUDF;
 use crate::physical_plan::ExecutionPlan;
 use crate::physical_plan::PhysicalPlanner;
-use crate::sql::{
-    parser::DFParser,
-    planner::{ContextProvider, SqlToRel},
-};
 use crate::variable::{VarProvider, VarType};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use datafusion_expr::TableSource;
+use datafusion_sql::{
+    parser::DFParser,
+    planner::{ContextProvider, SqlToRel},
+};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
@@ -126,7 +129,7 @@ const DEFAULT_SCHEMA: &str = "public";
 /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new()).await?;
 /// let df = df.filter(col("a").lt_eq(col("b")))?
 ///            .aggregate(vec![col("a")], vec![min(col("b"))])?
-///            .limit(100)?;
+///            .limit(None, Some(100))?;
 /// let results = df.collect();
 /// # Ok(())
 /// # }
@@ -288,15 +291,17 @@ impl SessionContext {
                 name,
                 input,
                 if_not_exists,
+                or_replace,
             }) => {
                 let table = self.table(name.as_str());
 
-                match (if_not_exists, table) {
-                    (true, Ok(_)) => {
+                match (if_not_exists, or_replace, table) {
+                    (true, false, Ok(_)) => {
                         let plan = LogicalPlanBuilder::empty(false).build()?;
                         Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
                     }
-                    (_, Err(_)) => {
+                    (false, true, Ok(_)) => {
+                        self.deregister_table(name.as_str())?;
                         let plan = self.optimize(&input)?;
                         let physical =
                             Arc::new(DataFrame::new(self.state.clone(), &plan));
@@ -310,7 +315,24 @@ impl SessionContext {
                         self.register_table(name.as_str(), table)?;
                         Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
                     }
-                    (false, Ok(_)) => Err(DataFusionError::Execution(format!(
+                    (true, true, Ok(_)) => Err(DataFusionError::Internal(
+                        "'IF NOT EXISTS' cannot coexist with 'REPLACE'".to_string(),
+                    )),
+                    (_, _, Err(_)) => {
+                        let plan = self.optimize(&input)?;
+                        let physical =
+                            Arc::new(DataFrame::new(self.state.clone(), &plan));
+
+                        let batches: Vec<_> = physical.collect_partitioned().await?;
+                        let table = Arc::new(MemTable::try_new(
+                            Arc::new(plan.schema().as_ref().into()),
+                            batches,
+                        )?);
+
+                        self.register_table(name.as_str(), table)?;
+                        Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
+                    }
+                    (false, false, Ok(_)) => Err(DataFusionError::Execution(format!(
                         "Table '{:?}' already exists",
                         name
                     ))),
@@ -328,16 +350,14 @@ impl SessionContext {
                     (true, Ok(_)) => {
                         self.deregister_table(name.as_str())?;
                         let plan = self.optimize(&input)?;
-                        let table =
-                            Arc::new(ViewTable::try_new(self.clone(), plan.clone())?);
+                        let table = Arc::new(ViewTable::try_new(plan.clone())?);
 
                         self.register_table(name.as_str(), table)?;
                         Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
                     }
                     (_, Err(_)) => {
                         let plan = self.optimize(&input)?;
-                        let table =
-                            Arc::new(ViewTable::try_new(self.clone(), plan.clone())?);
+                        let table = Arc::new(ViewTable::try_new(plan.clone())?);
 
                         self.register_table(name.as_str(), table)?;
                         Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
@@ -498,26 +518,24 @@ impl SessionContext {
     /// Creates a DataFrame for reading an Avro data source.
     pub async fn read_avro(
         &self,
-        uri: impl Into<String>,
+        table_path: impl AsRef<str>,
         options: AvroReadOptions<'_>,
     ) -> Result<Arc<DataFrame>> {
-        let uri: String = uri.into();
-        let (object_store, path) = self.runtime_env().object_store(&uri)?;
+        let table_path = ListingTableUrl::parse(table_path)?;
         let target_partitions = self.copied_config().target_partitions;
 
         let listing_options = options.to_listing_options(target_partitions);
-
-        let path: String = path.into();
 
         let resolved_schema = match options.schema {
             Some(s) => s,
             None => {
                 listing_options
-                    .infer_schema(Arc::clone(&object_store), &path)
+                    .infer_schema(&self.state(), &table_path)
                     .await?
             }
         };
-        let config = ListingTableConfig::new(object_store, path.clone())
+
+        let config = ListingTableConfig::new(table_path)
             .with_listing_options(listing_options)
             .with_schema(resolved_schema);
         let provider = ListingTable::try_new(config)?;
@@ -527,26 +545,23 @@ impl SessionContext {
     /// Creates a DataFrame for reading an Json data source.
     pub async fn read_json(
         &mut self,
-        uri: impl Into<String>,
+        table_path: impl AsRef<str>,
         options: NdJsonReadOptions<'_>,
     ) -> Result<Arc<DataFrame>> {
-        let uri: String = uri.into();
-        let (object_store, path) = self.runtime_env().object_store(&uri)?;
+        let table_path = ListingTableUrl::parse(table_path)?;
         let target_partitions = self.copied_config().target_partitions;
 
         let listing_options = options.to_listing_options(target_partitions);
-
-        let path: String = path.into();
 
         let resolved_schema = match options.schema {
             Some(s) => s,
             None => {
                 listing_options
-                    .infer_schema(Arc::clone(&object_store), &path)
+                    .infer_schema(&self.state(), &table_path)
                     .await?
             }
         };
-        let config = ListingTableConfig::new(object_store, path)
+        let config = ListingTableConfig::new(table_path)
             .with_listing_options(listing_options)
             .with_schema(resolved_schema);
         let provider = ListingTable::try_new(config)?;
@@ -565,50 +580,45 @@ impl SessionContext {
     /// Creates a DataFrame for reading a CSV data source.
     pub async fn read_csv(
         &self,
-        uri: impl Into<String>,
+        table_path: impl AsRef<str>,
         options: CsvReadOptions<'_>,
     ) -> Result<Arc<DataFrame>> {
-        let uri: String = uri.into();
-        let (object_store, path) = self.runtime_env().object_store(&uri)?;
+        let table_path = ListingTableUrl::parse(table_path)?;
         let target_partitions = self.copied_config().target_partitions;
-        let path = path.to_string();
         let listing_options = options.to_listing_options(target_partitions);
         let resolved_schema = match options.schema {
             Some(s) => Arc::new(s.to_owned()),
             None => {
                 listing_options
-                    .infer_schema(Arc::clone(&object_store), &path)
+                    .infer_schema(&self.state(), &table_path)
                     .await?
             }
         };
-        let config = ListingTableConfig::new(object_store, path.clone())
+        let config = ListingTableConfig::new(table_path.clone())
             .with_listing_options(listing_options)
             .with_schema(resolved_schema);
-        let provider = ListingTable::try_new(config)?;
 
-        let plan = LogicalPlanBuilder::scan(path, Arc::new(provider), None)?.build()?;
-        Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
+        let provider = ListingTable::try_new(config)?;
+        self.read_table(Arc::new(provider))
     }
 
     /// Creates a DataFrame for reading a Parquet data source.
     pub async fn read_parquet(
         &self,
-        uri: impl Into<String>,
+        table_path: impl AsRef<str>,
         options: ParquetReadOptions<'_>,
     ) -> Result<Arc<DataFrame>> {
-        let uri: String = uri.into();
-        let (object_store, path) = self.runtime_env().object_store(&uri)?;
+        let table_path = ListingTableUrl::parse(table_path)?;
         let target_partitions = self.copied_config().target_partitions;
 
         let listing_options = options.to_listing_options(target_partitions);
-        let path: String = path.into();
 
         // with parquet we resolve the schema in all cases
         let resolved_schema = listing_options
-            .infer_schema(Arc::clone(&object_store), &path)
+            .infer_schema(&self.state(), &table_path)
             .await?;
 
-        let config = ListingTableConfig::new(object_store, path)
+        let config = ListingTableConfig::new(table_path)
             .with_listing_options(listing_options)
             .with_schema(resolved_schema);
 
@@ -620,30 +630,27 @@ impl SessionContext {
     pub fn read_table(&self, provider: Arc<dyn TableProvider>) -> Result<Arc<DataFrame>> {
         Ok(Arc::new(DataFrame::new(
             self.state.clone(),
-            &LogicalPlanBuilder::scan(UNNAMED_TABLE, provider, None)?.build()?,
+            &LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(provider), None)?
+                .build()?,
         )))
     }
 
     /// Registers a table that uses the listing feature of the object store to
     /// find the files to be processed
     /// This is async because it might need to resolve the schema.
-    pub async fn register_listing_table<'a>(
-        &'a self,
-        name: &'a str,
-        uri: &'a str,
+    pub async fn register_listing_table(
+        &self,
+        name: &str,
+        table_path: impl AsRef<str>,
         options: ListingOptions,
         provided_schema: Option<SchemaRef>,
     ) -> Result<()> {
-        let (object_store, path) = self.runtime_env().object_store(uri)?;
+        let table_path = ListingTableUrl::parse(table_path)?;
         let resolved_schema = match provided_schema {
-            None => {
-                options
-                    .infer_schema(Arc::clone(&object_store), path)
-                    .await?
-            }
+            None => options.infer_schema(&self.state(), &table_path).await?,
             Some(s) => s,
         };
-        let config = ListingTableConfig::new(object_store, path)
+        let config = ListingTableConfig::new(table_path)
             .with_listing_options(options)
             .with_schema(resolved_schema);
         let table = ListingTable::try_new(config)?;
@@ -656,7 +663,7 @@ impl SessionContext {
     pub async fn register_csv(
         &self,
         name: &str,
-        uri: &str,
+        table_path: &str,
         options: CsvReadOptions<'_>,
     ) -> Result<()> {
         let listing_options =
@@ -664,7 +671,7 @@ impl SessionContext {
 
         self.register_listing_table(
             name,
-            uri,
+            table_path,
             listing_options,
             options.schema.map(|s| Arc::new(s.to_owned())),
         )
@@ -678,13 +685,13 @@ impl SessionContext {
     pub async fn register_json(
         &self,
         name: &str,
-        uri: &str,
+        table_path: &str,
         options: NdJsonReadOptions<'_>,
     ) -> Result<()> {
         let listing_options =
             options.to_listing_options(self.copied_config().target_partitions);
 
-        self.register_listing_table(name, uri, listing_options, options.schema)
+        self.register_listing_table(name, table_path, listing_options, options.schema)
             .await?;
         Ok(())
     }
@@ -694,7 +701,7 @@ impl SessionContext {
     pub async fn register_parquet(
         &self,
         name: &str,
-        uri: &str,
+        table_path: &str,
         options: ParquetReadOptions<'_>,
     ) -> Result<()> {
         let (target_partitions, parquet_pruning) = {
@@ -705,7 +712,7 @@ impl SessionContext {
             .parquet_pruning(parquet_pruning)
             .to_listing_options(target_partitions);
 
-        self.register_listing_table(name, uri, listing_options, None)
+        self.register_listing_table(name, table_path, listing_options, None)
             .await?;
         Ok(())
     }
@@ -715,13 +722,13 @@ impl SessionContext {
     pub async fn register_avro(
         &self,
         name: &str,
-        uri: &str,
+        table_path: &str,
         options: AvroReadOptions<'_>,
     ) -> Result<()> {
         let listing_options =
             options.to_listing_options(self.copied_config().target_partitions);
 
-        self.register_listing_table(name, uri, listing_options, options.schema)
+        self.register_listing_table(name, table_path, listing_options, options.schema)
             .await?;
         Ok(())
     }
@@ -817,7 +824,7 @@ impl SessionContext {
             Some(ref provider) => {
                 let plan = LogicalPlanBuilder::scan(
                     table_ref.table(),
-                    Arc::clone(provider),
+                    provider_as_source(Arc::clone(provider)),
                     None,
                 )?
                 .build()?;
@@ -913,6 +920,11 @@ impl SessionContext {
     /// Get a new TaskContext to run in this session
     pub fn task_ctx(&self) -> Arc<TaskContext> {
         Arc::new(TaskContext::from(self))
+    }
+
+    /// Get a copy of the [`SessionState`] of this [`SessionContext`]
+    pub fn state(&self) -> SessionState {
+        self.state.read().clone()
     }
 }
 
@@ -1117,75 +1129,13 @@ impl SessionConfig {
     }
 }
 
-/// Holds per-execution properties and data (such as starting timestamps, etc).
-/// An instance of this struct is created each time a [`LogicalPlan`] is prepared for
-/// execution (optimized). If the same plan is optimized multiple times, a new
-/// `ExecutionProps` is created each time.
-///
-/// It is important that this structure be cheap to create as it is
-/// done so during predicate pruning and expression simplification
-#[derive(Clone)]
-pub struct ExecutionProps {
-    pub(crate) query_execution_start_time: DateTime<Utc>,
-    /// providers for scalar variables
-    pub var_providers: Option<HashMap<VarType, Arc<dyn VarProvider + Send + Sync>>>,
-}
-
-impl Default for ExecutionProps {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ExecutionProps {
-    /// Creates a new execution props
-    pub fn new() -> Self {
-        ExecutionProps {
-            query_execution_start_time: chrono::Utc::now(),
-            var_providers: None,
-        }
-    }
-
-    /// Marks the execution of query started timestamp
-    pub fn start_execution(&mut self) -> &Self {
-        self.query_execution_start_time = chrono::Utc::now();
-        &*self
-    }
-
-    /// Registers a variable provider, returning the existing
-    /// provider, if any
-    pub fn add_var_provider(
-        &mut self,
-        var_type: VarType,
-        provider: Arc<dyn VarProvider + Send + Sync>,
-    ) -> Option<Arc<dyn VarProvider + Send + Sync>> {
-        let mut var_providers = self.var_providers.take().unwrap_or_default();
-
-        let old_provider = var_providers.insert(var_type, provider);
-
-        self.var_providers = Some(var_providers);
-
-        old_provider
-    }
-
-    /// Returns the provider for the var_type, if any
-    pub fn get_var_provider(
-        &self,
-        var_type: VarType,
-    ) -> Option<Arc<dyn VarProvider + Send + Sync>> {
-        self.var_providers
-            .as_ref()
-            .and_then(|var_providers| var_providers.get(&var_type).map(Arc::clone))
-    }
-}
-
 /// Execution context for registering data sources and executing queries
 #[derive(Clone)]
 pub struct SessionState {
     /// Uuid for the session
     pub session_id: String,
     /// Responsible for optimizing a logical plan
-    pub optimizers: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
+    pub optimizer: Optimizer,
     /// Responsible for optimizing a physical execution plan
     pub physical_optimizers: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
     /// Responsible for planning `LogicalPlan`s, and `ExecutionPlan`
@@ -1251,7 +1201,7 @@ impl SessionState {
 
         SessionState {
             session_id,
-            optimizers: vec![
+            optimizer: Optimizer::new(vec![
                 // Simplify expressions first to maximize the chance
                 // of applying other optimizations
                 Arc::new(SimplifyExpressions::new()),
@@ -1263,7 +1213,7 @@ impl SessionState {
                 Arc::new(FilterPushDown::new()),
                 Arc::new(LimitPushDown::new()),
                 Arc::new(SingleDistinctToGroupBy::new()),
-            ],
+            ]),
             physical_optimizers: vec![
                 Arc::new(AggregateStatistics::new()),
                 Arc::new(HashBuildProbeOrder::new()),
@@ -1324,9 +1274,9 @@ impl SessionState {
     /// Replace the optimizer rules
     pub fn with_optimizer_rules(
         mut self,
-        optimizers: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
+        rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
     ) -> Self {
-        self.optimizers = optimizers;
+        self.optimizer = Optimizer::new(rules);
         self
     }
 
@@ -1344,7 +1294,7 @@ impl SessionState {
         mut self,
         optimizer_rule: Arc<dyn OptimizerRule + Send + Sync>,
     ) -> Self {
-        self.optimizers.push(optimizer_rule);
+        self.optimizer.rules.push(optimizer_rule);
         self
     }
 
@@ -1359,16 +1309,23 @@ impl SessionState {
 
     /// Optimizes the logical plan by applying optimizer rules.
     pub fn optimize(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
+        let mut optimizer_config = OptimizerConfig::new();
+        optimizer_config.query_execution_start_time =
+            self.execution_props.query_execution_start_time;
+
         if let LogicalPlan::Explain(e) = plan {
             let mut stringified_plans = e.stringified_plans.clone();
 
             // optimize the child plan, capturing the output of each optimizer
-            let plan =
-                self.optimize_internal(e.plan.as_ref(), |optimized_plan, optimizer| {
+            let plan = self.optimizer.optimize(
+                e.plan.as_ref(),
+                &optimizer_config,
+                |optimized_plan, optimizer| {
                     let optimizer_name = optimizer.name().to_string();
                     let plan_type = PlanType::OptimizedLogicalPlan { optimizer_name };
                     stringified_plans.push(optimized_plan.to_stringified(plan_type));
-                })?;
+                },
+            )?;
 
             Ok(LogicalPlan::Explain(Explain {
                 verbose: e.verbose,
@@ -1377,35 +1334,8 @@ impl SessionState {
                 schema: e.schema.clone(),
             }))
         } else {
-            self.optimize_internal(plan, |_, _| {})
+            self.optimizer.optimize(plan, &optimizer_config, |_, _| {})
         }
-    }
-
-    /// Optimizes the logical plan by applying optimizer rules, and
-    /// invoking observer function after each call
-    fn optimize_internal<F>(
-        &self,
-        plan: &LogicalPlan,
-        mut observer: F,
-    ) -> Result<LogicalPlan>
-    where
-        F: FnMut(&LogicalPlan, &dyn OptimizerRule),
-    {
-        let execution_props = &mut self.execution_props.clone();
-        let optimizers = &self.optimizers;
-
-        let execution_props = execution_props.start_execution();
-
-        let mut new_plan = plan.clone();
-        debug!("Input logical plan:\n{}\n", plan.display_indent());
-        trace!("Full input logical plan:\n{:?}", plan);
-        for optimizer in optimizers {
-            new_plan = optimizer.optimize(&new_plan, execution_props)?;
-            observer(&new_plan, optimizer.as_ref());
-        }
-        debug!("Optimized logical plan:\n{}\n", new_plan.display_indent());
-        trace!("Full Optimized logical plan:\n {:?}", plan);
-        Ok(new_plan)
     }
 
     /// Creates a physical plan from a logical plan.
@@ -1420,15 +1350,18 @@ impl SessionState {
 }
 
 impl ContextProvider for SessionState {
-    fn get_table_provider(&self, name: TableReference) -> Result<Arc<dyn TableProvider>> {
+    fn get_table_provider(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
         let resolved_ref = self.resolve_table_ref(name);
         match self.schema_for_ref(resolved_ref) {
-            Ok(schema) => schema.table(resolved_ref.table).ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "'{}.{}.{}' not found",
-                    resolved_ref.catalog, resolved_ref.schema, resolved_ref.table
-                ))
-            }),
+            Ok(schema) => {
+                let provider = schema.table(resolved_ref.table).ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "'{}.{}.{}' not found",
+                        resolved_ref.catalog, resolved_ref.schema, resolved_ref.table
+                    ))
+                })?;
+                Ok(provider_as_source(provider))
+            }
             Err(e) => Err(e),
         }
     }
@@ -1658,7 +1591,6 @@ impl FunctionRegistry for TaskContext {
 mod tests {
     use super::*;
     use crate::execution::context::QueryPlanner;
-    use crate::physical_plan::functions::make_scalar_function;
     use crate::test;
     use crate::test_util::parquet_test_data;
     use crate::variable::VarType;
@@ -1672,6 +1604,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use async_trait::async_trait;
     use datafusion_expr::Volatility;
+    use datafusion_physical_expr::functions::make_scalar_function;
     use std::fs::File;
     use std::sync::Weak;
     use std::thread::{self, JoinHandle};

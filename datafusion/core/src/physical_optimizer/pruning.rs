@@ -31,15 +31,7 @@
 use std::convert::TryFrom;
 use std::{collections::HashSet, sync::Arc};
 
-use arrow::{
-    array::{new_null_array, ArrayRef, BooleanArray},
-    datatypes::{DataType, Field, Schema, SchemaRef},
-    record_batch::RecordBatch,
-};
-use datafusion_expr::utils::expr_to_columns;
-
 use crate::execution::context::ExecutionProps;
-use crate::physical_plan::planner::create_physical_expr;
 use crate::prelude::lit;
 use crate::{
     error::{DataFusionError, Result},
@@ -47,6 +39,14 @@ use crate::{
     optimizer::utils,
     physical_plan::{ColumnarValue, PhysicalExpr},
 };
+use arrow::{
+    array::{new_null_array, ArrayRef, BooleanArray},
+    datatypes::{DataType, Field, Schema, SchemaRef},
+    record_batch::RecordBatch,
+};
+use datafusion_expr::binary_expr;
+use datafusion_expr::utils::expr_to_columns;
+use datafusion_physical_expr::create_physical_expr;
 
 /// Interface to pass statistics information to [`PruningPredicate`]
 ///
@@ -532,14 +532,11 @@ fn rewrite_expr_to_prunable(
             };
         }
 
-        _ => {
-            return Err(DataFusionError::Plan(format!(
-                "column expression {:?} is not supported",
-                column_expr
-            )))
-        }
+        _ => Err(DataFusionError::Plan(format!(
+            "column expression {:?} is not supported",
+            column_expr
+        ))),
     }
-    // Ok((column_expr.clone(), op, scalar_expr.clone()))
 }
 
 fn is_compare_op(op: Operator) -> bool {
@@ -711,7 +708,7 @@ fn build_predicate_expression(
     if op == Operator::And || op == Operator::Or {
         let left_expr = build_predicate_expression(left, schema, required_columns)?;
         let right_expr = build_predicate_expression(right, schema, required_columns)?;
-        return Ok(logical_plan::binary_expr(left_expr, op, right_expr));
+        return Ok(binary_expr(left_expr, op, right_expr));
     }
 
     let expr_builder =
@@ -784,7 +781,7 @@ fn build_statistics_expr(expr_builder: &mut PruningExpressionBuilder) -> Result<
     Ok(statistics_expr)
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum StatisticsType {
     Min,
     Max,

@@ -124,7 +124,7 @@ async fn avro_single_nan_schema() {
     let plan = ctx.create_logical_plan(sql).unwrap();
     let plan = ctx.optimize(&plan).unwrap();
     let plan = ctx.create_physical_plan(&plan).await.unwrap();
-    let runtime = ctx.state.lock().runtime_env.clone();
+    let runtime = ctx.task_ctx();
     let results = collect(plan, runtime).await.unwrap();
     for batch in results {
         assert_eq!(1, batch.num_rows());
@@ -145,7 +145,7 @@ async fn avro_explain() {
             "logical_plan",
             "Projection: #COUNT(UInt8(1))\
             \n  Aggregate: groupBy=[[]], aggr=[[COUNT(UInt8(1))]]\
-            \n    TableScan: alltypes_plain projection=Some([0])",
+            \n    TableScan: alltypes_plain projection=Some([id])",
         ],
         vec![
             "physical_plan",

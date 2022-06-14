@@ -17,30 +17,30 @@
 
 //! DataFrame API for building and executing query plans.
 
-use crate::arrow::record_batch::RecordBatch;
-use crate::error::Result;
-use crate::logical_plan::{
-    col, DFSchema, Expr, FunctionRegistry, JoinType, LogicalPlan, LogicalPlanBuilder,
-    Partitioning,
-};
-use parquet::file::properties::WriterProperties;
-use std::sync::Arc;
-
-use crate::physical_plan::SendableRecordBatchStream;
-use async_trait::async_trait;
-
 use crate::arrow::datatypes::Schema;
 use crate::arrow::datatypes::SchemaRef;
+use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::pretty;
 use crate::datasource::TableProvider;
-use crate::execution::context::{SessionState, TaskContext};
+use crate::error::Result;
+use crate::execution::{
+    context::{SessionState, TaskContext},
+    FunctionRegistry,
+};
 use crate::logical_expr::{utils::find_window_exprs, TableType};
+use crate::logical_plan::{
+    col, DFSchema, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Partitioning,
+};
 use crate::physical_plan::file_format::{plan_to_csv, plan_to_json, plan_to_parquet};
+use crate::physical_plan::SendableRecordBatchStream;
 use crate::physical_plan::{collect, collect_partitioned};
 use crate::physical_plan::{execute_stream, execute_stream_partitioned, ExecutionPlan};
 use crate::scalar::ScalarValue;
+use async_trait::async_trait;
 use parking_lot::RwLock;
+use parquet::file::properties::WriterProperties;
 use std::any::Any;
+use std::sync::Arc;
 
 /// DataFrame represents a logical set of rows with the same named columns.
 /// Similar to a [Pandas DataFrame](https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.html) or
@@ -62,7 +62,7 @@ use std::any::Any;
 /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new()).await?;
 /// let df = df.filter(col("a").lt_eq(col("b")))?
 ///            .aggregate(vec![col("a")], vec![min(col("b"))])?
-///            .limit(100)?;
+///            .limit(None, Some(100))?;
 /// let results = df.collect();
 /// # Ok(())
 /// # }
@@ -190,6 +190,9 @@ impl DataFrame {
 
     /// Limit the number of rows returned from this DataFrame.
     ///
+    /// `skip` - Number of rows to skip before fetch any row
+    ///
+    /// `fetch` - Maximum number of rows to fetch, after skipping `skip` rows.
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
@@ -197,18 +200,23 @@ impl DataFrame {
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
     /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new()).await?;
-    /// let df = df.limit(100)?;
+    /// let df = df.limit(None, Some(100))?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn limit(&self, n: usize) -> Result<Arc<DataFrame>> {
+    pub fn limit(
+        &self,
+        skip: Option<usize>,
+        fetch: Option<usize>,
+    ) -> Result<Arc<DataFrame>> {
         let plan = LogicalPlanBuilder::from(self.plan.clone())
-            .limit(n)?
+            .limit(skip, fetch)?
             .build()?;
         Ok(Arc::new(DataFrame::new(self.session_state.clone(), &plan)))
     }
 
-    /// Calculate the union two [`DataFrame`]s.  The two [`DataFrame`]s must have exactly the same schema
+    /// Calculate the union of two [`DataFrame`]s, preserving duplicate rows.The
+    /// two [`DataFrame`]s must have exactly the same schema
     ///
     /// ```
     /// # use datafusion::prelude::*;
@@ -228,7 +236,8 @@ impl DataFrame {
         Ok(Arc::new(DataFrame::new(self.session_state.clone(), &plan)))
     }
 
-    /// Calculate the union distinct two [`DataFrame`]s.  The two [`DataFrame`]s must have exactly the same schema
+    /// Calculate the distinct union of two [`DataFrame`]s.  The
+    /// two [`DataFrame`]s must have exactly the same schema
     ///
     /// ```
     /// # use datafusion::prelude::*;
@@ -237,7 +246,28 @@ impl DataFrame {
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
     /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new()).await?;
-    /// let df = df.union(df.clone())?;
+    /// let df = df.union_distinct(df.clone())?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn union_distinct(&self, dataframe: Arc<DataFrame>) -> Result<Arc<DataFrame>> {
+        Ok(Arc::new(DataFrame::new(
+            self.session_state.clone(),
+            &LogicalPlanBuilder::from(self.plan.clone())
+                .union_distinct(dataframe.plan.clone())?
+                .build()?,
+        )))
+    }
+
+    /// Filter out duplicate rows
+    ///
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// let ctx = SessionContext::new();
+    /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new()).await?;
     /// let df = df.distinct()?;
     /// # Ok(())
     /// # }
@@ -272,7 +302,11 @@ impl DataFrame {
         Ok(Arc::new(DataFrame::new(self.session_state.clone(), &plan)))
     }
 
-    /// Join this DataFrame with another DataFrame using the specified columns as join keys
+    /// Join this DataFrame with another DataFrame using the specified columns as join keys.
+    ///
+    /// Filter expression expected to contain non-equality predicates that can not be pushed
+    /// down to any of join inputs.
+    /// In case of outer join, filter applied to only matched rows.
     ///
     /// ```
     /// # use datafusion::prelude::*;
@@ -286,7 +320,7 @@ impl DataFrame {
     ///     col("a").alias("a2"),
     ///     col("b").alias("b2"),
     ///     col("c").alias("c2")])?;
-    /// let join = left.join(right, JoinType::Inner, &["a", "b"], &["a2", "b2"])?;
+    /// let join = left.join(right, JoinType::Inner, &["a", "b"], &["a2", "b2"], None)?;
     /// let batches = join.collect().await?;
     /// # Ok(())
     /// # }
@@ -297,12 +331,14 @@ impl DataFrame {
         join_type: JoinType,
         left_cols: &[&str],
         right_cols: &[&str],
+        filter: Option<Expr>,
     ) -> Result<Arc<DataFrame>> {
         let plan = LogicalPlanBuilder::from(self.plan.clone())
             .join(
                 &right.plan.clone(),
                 join_type,
                 (left_cols.to_vec(), right_cols.to_vec()),
+                filter,
             )?
             .build()?;
         Ok(Arc::new(DataFrame::new(self.session_state.clone(), &plan)))
@@ -385,7 +421,7 @@ impl DataFrame {
     /// # }
     /// ```
     pub async fn show_limit(&self, num: usize) -> Result<()> {
-        let results = self.limit(num)?.collect().await?;
+        let results = self.limit(None, Some(num))?.collect().await?;
         Ok(pretty::print_batches(&results)?)
     }
 
@@ -485,7 +521,7 @@ impl DataFrame {
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
     /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new()).await?;
-    /// let batches = df.limit(100)?.explain(false, false)?.collect().await?;
+    /// let batches = df.limit(None, Some(100))?.explain(false, false)?.collect().await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -586,6 +622,7 @@ impl DataFrame {
     }
 }
 
+// TODO: This will introduce a ref cycle (#2659)
 #[async_trait]
 impl TableProvider for DataFrame {
     fn as_any(&self) -> &dyn Any {
@@ -603,6 +640,7 @@ impl TableProvider for DataFrame {
 
     async fn scan(
         &self,
+        _ctx: &SessionState,
         projection: &Option<Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -634,7 +672,7 @@ impl TableProvider for DataFrame {
         Self::new(
             self.session_state.clone(),
             &limit
-                .map_or_else(|| Ok(expr.clone()), |n| expr.limit(n))?
+                .map_or_else(|| Ok(expr.clone()), |n| expr.limit(None, Some(n)))?
                 .plan
                 .clone(),
         )
@@ -756,7 +794,7 @@ mod tests {
             .select_columns(&["c1", "c3"])?;
         let left_rows = left.collect().await?;
         let right_rows = right.collect().await?;
-        let join = left.join(right, JoinType::Inner, &["c1"], &["c1"])?;
+        let join = left.join(right, JoinType::Inner, &["c1"], &["c1"], None)?;
         let join_rows = join.collect().await?;
         assert_eq!(100, left_rows.iter().map(|x| x.num_rows()).sum::<usize>());
         assert_eq!(100, right_rows.iter().map(|x| x.num_rows()).sum::<usize>());
@@ -768,7 +806,9 @@ mod tests {
     async fn limit() -> Result<()> {
         // build query using Table API
         let t = test_table().await?;
-        let t2 = t.select_columns(&["c1", "c2", "c11"])?.limit(10)?;
+        let t2 = t
+            .select_columns(&["c1", "c2", "c11"])?
+            .limit(None, Some(10))?;
         let plan = t2.plan.clone();
 
         // build query using SQL
@@ -787,7 +827,7 @@ mod tests {
         let df = test_table().await?;
         let df = df
             .select_columns(&["c1", "c2", "c11"])?
-            .limit(10)?
+            .limit(None, Some(10))?
             .explain(false, false)?;
         let plan = df.plan.clone();
 

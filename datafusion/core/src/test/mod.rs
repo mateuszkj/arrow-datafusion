@@ -18,17 +18,18 @@
 //! Common unit test utility methods
 
 use crate::arrow::array::UInt32Array;
-use crate::datasource::{listing::local_unpartitioned_file, MemTable, TableProvider};
+use crate::datasource::object_store::ObjectStoreUrl;
+use crate::datasource::{MemTable, TableProvider};
 use crate::error::Result;
 use crate::from_slice::FromSlice;
-use crate::logical_plan::{LogicalPlan, LogicalPlanBuilder};
+use crate::logical_plan::LogicalPlan;
 use crate::physical_plan::file_format::{CsvExec, FileScanConfig};
 use crate::test_util::aggr_test_schema;
 use array::{Array, ArrayRef};
 use arrow::array::{self, DecimalBuilder, Int32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use datafusion_data_access::object_store::local::LocalFileSystem;
+use datafusion_data_access::object_store::local::local_unpartitioned_file;
 use futures::{Future, FutureExt};
 use std::fs::File;
 use std::io::prelude::*;
@@ -108,14 +109,16 @@ pub fn partitioned_csv_config(
 
         files
             .into_iter()
-            .map(|f| vec![local_unpartitioned_file(f.to_str().unwrap().to_owned())])
+            .map(
+                |f| vec![local_unpartitioned_file(f.to_str().unwrap().to_owned()).into()],
+            )
             .collect::<Vec<_>>()
     } else {
-        vec![vec![local_unpartitioned_file(path)]]
+        vec![vec![local_unpartitioned_file(path).into()]]
     };
 
     Ok(FileScanConfig {
-        object_store: Arc::new(LocalFileSystem {}),
+        object_store_url: ObjectStoreUrl::local_filesystem(),
         file_schema: schema,
         file_groups,
         statistics: Default::default(),
@@ -123,21 +126,6 @@ pub fn partitioned_csv_config(
         limit: None,
         table_partition_cols: vec![],
     })
-}
-
-/// some tests share a common table with different names
-pub fn test_table_scan_with_name(name: &str) -> Result<LogicalPlan> {
-    let schema = Schema::new(vec![
-        Field::new("a", DataType::UInt32, false),
-        Field::new("b", DataType::UInt32, false),
-        Field::new("c", DataType::UInt32, false),
-    ]);
-    LogicalPlanBuilder::scan_empty(Some(name), &schema, None)?.build()
-}
-
-/// some tests share a common table
-pub fn test_table_scan() -> Result<LogicalPlan> {
-    test_table_scan_with_name("test")
 }
 
 pub fn assert_fields_eq(plan: &LogicalPlan, expected: Vec<&str>) {
@@ -256,5 +244,4 @@ fn create_batch(schema: &Schema) -> RecordBatch {
 
 pub mod exec;
 pub mod object_store;
-pub mod user_defined;
 pub mod variable;

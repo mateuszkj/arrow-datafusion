@@ -149,15 +149,88 @@ async fn equijoin_right_and_condition_from_left() -> Result<()> {
 }
 
 #[tokio::test]
-async fn equijoin_and_unsupported_condition() -> Result<()> {
+async fn equijoin_left_and_condition_from_left() -> Result<()> {
     let ctx = create_join_context("t1_id", "t2_id")?;
     let sql =
-        "SELECT t1_id, t1_name, t2_name FROM t1 LEFT JOIN t2 ON t1_id = t2_id AND t1_id >= '44' ORDER BY t1_id";
+        "SELECT t1_id, t1_name, t2_name FROM t1 LEFT JOIN t2 ON t1_id = t2_id AND t1_id >= 44 ORDER BY t1_id";
+    let expected = vec![
+        "+-------+---------+---------+",
+        "| t1_id | t1_name | t2_name |",
+        "+-------+---------+---------+",
+        "| 11    | a       |         |",
+        "| 22    | b       |         |",
+        "| 33    | c       |         |",
+        "| 44    | d       | x       |",
+        "+-------+---------+---------+",
+    ];
+    let actual = execute_to_batches(&ctx, sql).await;
+    assert_batches_eq!(expected, &actual);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn equijoin_left_and_condition_from_both() -> Result<()> {
+    let ctx = create_join_context("t1_id", "t2_id")?;
+    let sql =
+        "SELECT t1_id, t1_int, t2_int FROM t1 LEFT JOIN t2 ON t1_id = t2_id AND t1_int >= t2_int ORDER BY t1_id";
+    let expected = vec![
+        "+-------+--------+--------+",
+        "| t1_id | t1_int | t2_int |",
+        "+-------+--------+--------+",
+        "| 11    | 1      |        |",
+        "| 22    | 2      | 1      |",
+        "| 33    | 3      |        |",
+        "| 44    | 4      | 3      |",
+        "+-------+--------+--------+",
+    ];
+    let actual = execute_to_batches(&ctx, sql).await;
+    assert_batches_eq!(expected, &actual);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn equijoin_right_and_condition_from_right() -> Result<()> {
+    let ctx = create_join_context("t1_id", "t2_id")?;
+    let sql =
+        "SELECT t1_id, t1_name, t2_name FROM t1 RIGHT JOIN t2 ON t1_id = t2_id AND t2_id >= 22 ORDER BY t2_name";
     let res = ctx.create_logical_plan(sql);
+    assert!(res.is_ok());
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+-------+---------+---------+",
+        "| t1_id | t1_name | t2_name |",
+        "+-------+---------+---------+",
+        "|       |         | w       |",
+        "| 44    | d       | x       |",
+        "| 22    | b       | y       |",
+        "|       |         | z       |",
+        "+-------+---------+---------+",
+    ];
+    assert_batches_eq!(expected, &actual);
+    Ok(())
+}
 
-    assert!(res.is_err());
-    assert_eq!(format!("{}", res.unwrap_err()), "This feature is not implemented: Unsupported expressions in Left JOIN: [#t1_id >= Utf8(\"44\")]");
-
+#[tokio::test]
+async fn equijoin_right_and_condition_from_both() -> Result<()> {
+    let ctx = create_join_context("t1_id", "t2_id")?;
+    let sql =
+        "SELECT t1_int, t2_int, t2_id FROM t1 RIGHT JOIN t2 ON t1_id = t2_id AND t2_int <= t1_int ORDER BY t2_id";
+    let res = ctx.create_logical_plan(sql);
+    assert!(res.is_ok());
+    let actual = execute_to_batches(&ctx, sql).await;
+    let expected = vec![
+        "+--------+--------+-------+",
+        "| t1_int | t2_int | t2_id |",
+        "+--------+--------+-------+",
+        "|        | 3      | 11    |",
+        "| 2      | 1      | 22    |",
+        "| 4      | 3      | 44    |",
+        "|        | 3      | 55    |",
+        "+--------+--------+-------+",
+    ];
+    assert_batches_eq!(expected, &actual);
     Ok(())
 }
 
@@ -1128,6 +1201,144 @@ async fn join_partitioned() -> Result<()> {
         results.iter().map(|b| b.num_rows()).sum::<usize>(),
         4 * 10 * 10
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn join_with_hash_unsupported_data_type() -> Result<()> {
+    let ctx = SessionContext::new();
+
+    let schema = Schema::new(vec![
+        Field::new("c1", DataType::Int32, true),
+        Field::new("c2", DataType::Utf8, true),
+        Field::new("c3", DataType::Int64, true),
+        Field::new("c4", DataType::Date32, true),
+    ]);
+    let data = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int32Array::from_slice(&[1, 2, 3])),
+            Arc::new(StringArray::from_slice(&["aaa", "bbb", "ccc"])),
+            Arc::new(Int64Array::from_slice(&[100, 200, 300])),
+            Arc::new(Date32Array::from(vec![Some(1), Some(2), Some(3)])),
+        ],
+    )?;
+    let table = MemTable::try_new(data.schema(), vec![vec![data]])?;
+    ctx.register_table("foo", Arc::new(table))?;
+
+    // join on hash unsupported data type (Date32), use cross join instead hash join
+    let sql = "select * from foo t1 join foo t2 on t1.c4 = t2.c4";
+    let msg = format!("Creating logical plan for '{}'", sql);
+    let plan = ctx
+        .create_logical_plan(&("explain ".to_owned() + sql))
+        .expect(&msg);
+    let state = ctx.state();
+    let plan = state.optimize(&plan)?;
+    let expected = vec![
+        "Explain [plan_type:Utf8, plan:Utf8]",
+        "  Projection: #t1.c1, #t1.c2, #t1.c3, #t1.c4, #t2.c1, #t2.c2, #t2.c3, #t2.c4 [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N, c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "    Filter: #t1.c4 = #t2.c4 [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N, c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "      CrossJoin: [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N, c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "        SubqueryAlias: t1 [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "          TableScan: foo projection=Some([c1, c2, c3, c4]) [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "        SubqueryAlias: t2 [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "          TableScan: foo projection=Some([c1, c2, c3, c4]) [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+    ];
+    let formatted = plan.display_indent_schema().to_string();
+    let actual: Vec<&str> = formatted.trim().lines().collect();
+    assert_eq!(
+        expected, actual,
+        "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+        expected, actual
+    );
+
+    let expected = vec![
+        "+----+-----+-----+------------+----+-----+-----+------------+",
+        "| c1 | c2  | c3  | c4         | c1 | c2  | c3  | c4         |",
+        "+----+-----+-----+------------+----+-----+-----+------------+",
+        "| 1  | aaa | 100 | 1970-01-02 | 1  | aaa | 100 | 1970-01-02 |",
+        "| 2  | bbb | 200 | 1970-01-03 | 2  | bbb | 200 | 1970-01-03 |",
+        "| 3  | ccc | 300 | 1970-01-04 | 3  | ccc | 300 | 1970-01-04 |",
+        "+----+-----+-----+------------+----+-----+-----+------------+",
+    ];
+
+    let results = execute_to_batches(&ctx, sql).await;
+    assert_batches_sorted_eq!(expected, &results);
+
+    // join on hash supported data type (Int32), use hash join
+    let sql = "select * from foo t1 join foo t2 on t1.c1 = t2.c1";
+    let plan = ctx
+        .create_logical_plan(&("explain ".to_owned() + sql))
+        .expect(&msg);
+    let plan = state.optimize(&plan)?;
+    let expected = vec![
+        "Explain [plan_type:Utf8, plan:Utf8]",
+        "  Projection: #t1.c1, #t1.c2, #t1.c3, #t1.c4, #t2.c1, #t2.c2, #t2.c3, #t2.c4 [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N, c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "    Inner Join: #t1.c1 = #t2.c1 [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N, c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "      SubqueryAlias: t1 [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "        TableScan: foo projection=Some([c1, c2, c3, c4]) [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "      SubqueryAlias: t2 [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "        TableScan: foo projection=Some([c1, c2, c3, c4]) [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+    ];
+    let formatted = plan.display_indent_schema().to_string();
+    let actual: Vec<&str> = formatted.trim().lines().collect();
+    assert_eq!(
+        expected, actual,
+        "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+        expected, actual
+    );
+
+    let expected = vec![
+        "+----+-----+-----+------------+----+-----+-----+------------+",
+        "| c1 | c2  | c3  | c4         | c1 | c2  | c3  | c4         |",
+        "+----+-----+-----+------------+----+-----+-----+------------+",
+        "| 1  | aaa | 100 | 1970-01-02 | 1  | aaa | 100 | 1970-01-02 |",
+        "| 2  | bbb | 200 | 1970-01-03 | 2  | bbb | 200 | 1970-01-03 |",
+        "| 3  | ccc | 300 | 1970-01-04 | 3  | ccc | 300 | 1970-01-04 |",
+        "+----+-----+-----+------------+----+-----+-----+------------+",
+    ];
+
+    let results = execute_to_batches(&ctx, sql).await;
+    assert_batches_sorted_eq!(expected, &results);
+
+    // join on two columns, hash supported data type(Int64) and hash unsupported data type (Date32),
+    // use hash join on Int64 column, and filter on Date32 column.
+    let sql = "select * from foo t1, foo t2 where t1.c3 = t2.c3 and t1.c4 = t2.c4";
+    let plan = ctx
+        .create_logical_plan(&("explain ".to_owned() + sql))
+        .expect(&msg);
+    let plan = state.optimize(&plan)?;
+    let expected = vec![
+        "Explain [plan_type:Utf8, plan:Utf8]",
+        "  Projection: #t1.c1, #t1.c2, #t1.c3, #t1.c4, #t2.c1, #t2.c2, #t2.c3, #t2.c4 [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N, c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "    Filter: #t1.c4 = #t2.c4 [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N, c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "      Inner Join: #t1.c3 = #t2.c3 [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N, c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "        SubqueryAlias: t1 [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "          TableScan: foo projection=Some([c1, c2, c3, c4]) [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "        SubqueryAlias: t2 [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+        "          TableScan: foo projection=Some([c1, c2, c3, c4]) [c1:Int32;N, c2:Utf8;N, c3:Int64;N, c4:Date32;N]",
+    ];
+    let formatted = plan.display_indent_schema().to_string();
+    let actual: Vec<&str> = formatted.trim().lines().collect();
+    assert_eq!(
+        expected, actual,
+        "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+        expected, actual
+    );
+
+    let expected = vec![
+        "+----+-----+-----+------------+----+-----+-----+------------+",
+        "| c1 | c2  | c3  | c4         | c1 | c2  | c3  | c4         |",
+        "+----+-----+-----+------------+----+-----+-----+------------+",
+        "| 1  | aaa | 100 | 1970-01-02 | 1  | aaa | 100 | 1970-01-02 |",
+        "| 2  | bbb | 200 | 1970-01-03 | 2  | bbb | 200 | 1970-01-03 |",
+        "| 3  | ccc | 300 | 1970-01-04 | 3  | ccc | 300 | 1970-01-04 |",
+        "+----+-----+-----+------------+----+-----+-----+------------+",
+    ];
+
+    let results = execute_to_batches(&ctx, sql).await;
+    assert_batches_sorted_eq!(expected, &results);
 
     Ok(())
 }

@@ -544,10 +544,10 @@ impl ScalarValue {
         if precision <= DECIMAL_MAX_PRECISION && scale <= precision {
             return Ok(ScalarValue::Decimal128(Some(value), precision, scale));
         }
-        return Err(DataFusionError::Internal(format!(
+        Err(DataFusionError::Internal(format!(
             "Can not new a decimal type ScalarValue for precision {} and scale {}",
             precision, scale
-        )));
+        )))
     }
     /// Getter for the `DataType` of the value
     pub fn get_datatype(&self) -> DataType {
@@ -1059,7 +1059,7 @@ impl ScalarValue {
         let offsets_array = offsets.finish();
         let array_data = ArrayDataBuilder::new(data_type.clone())
             .len(offsets_array.len() - 1)
-            .null_bit_buffer(valid.finish())
+            .null_bit_buffer(Some(valid.finish()))
             .add_buffer(offsets_array.data().buffers()[0].clone())
             .add_child_data(flat_array.data().clone());
 

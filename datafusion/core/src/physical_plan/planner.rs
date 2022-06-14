@@ -19,55 +19,55 @@
 
 use super::analyze::AnalyzeExec;
 use super::{
-    aggregates, empty::EmptyExec, expressions::binary, functions,
-    hash_join::PartitionMode, udaf, union::UnionExec, values::ValuesExec, windows,
+    aggregates, empty::EmptyExec, hash_join::PartitionMode, udaf, union::UnionExec,
+    values::ValuesExec, windows,
 };
+use crate::datasource::source_as_provider;
 use crate::execution::context::{ExecutionProps, SessionState};
 use crate::logical_expr::utils::generate_sort_key;
 use crate::logical_plan::plan::{
-    source_as_provider, Aggregate, EmptyRelation, Filter, Join, Projection, Sort,
-    SubqueryAlias, TableScan, Window,
+    Aggregate, EmptyRelation, Filter, Join, Projection, Sort, SubqueryAlias, TableScan,
+    Window,
 };
 use crate::logical_plan::{
-    unalias, unnormalize_cols, CrossJoin, DFSchema, Expr, LogicalPlan, Operator,
+    unalias, unnormalize_cols, CrossJoin, DFSchema, Expr, LogicalPlan,
     Partitioning as LogicalPartitioning, PlanType, Repartition, ToStringifiedPlan, Union,
     UserDefinedLogicalNode,
 };
 use crate::logical_plan::{Limit, Values};
+use crate::physical_expr::create_physical_expr;
 use crate::physical_optimizer::optimizer::PhysicalOptimizerRule;
-use crate::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use crate::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use crate::physical_plan::cross_join::CrossJoinExec;
 use crate::physical_plan::explain::ExplainExec;
-use crate::physical_plan::expressions;
-use crate::physical_plan::expressions::{
-    CaseExpr, Column, GetIndexedFieldExpr, Literal, PhysicalSortExpr,
-};
+use crate::physical_plan::expressions::{Column, PhysicalSortExpr};
 use crate::physical_plan::filter::FilterExec;
 use crate::physical_plan::hash_join::HashJoinExec;
 use crate::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use crate::physical_plan::projection::ProjectionExec;
 use crate::physical_plan::repartition::RepartitionExec;
 use crate::physical_plan::sorts::sort::SortExec;
-use crate::physical_plan::udf;
 use crate::physical_plan::windows::WindowAggExec;
 use crate::physical_plan::{join_utils, Partitioning};
 use crate::physical_plan::{AggregateExpr, ExecutionPlan, PhysicalExpr, WindowExpr};
-use crate::scalar::ScalarValue;
-use crate::sql::utils::window_expr_common_partition_keys;
-use crate::variable::VarType;
 use crate::{
     error::{DataFusionError, Result},
     physical_plan::displayable,
 };
 use arrow::compute::SortOptions;
+use arrow::datatypes::DataType;
 use arrow::datatypes::{Schema, SchemaRef};
-use arrow::{compute::can_cast_types, datatypes::DataType};
 use async_trait::async_trait;
-use datafusion_expr::expr::GroupingSet;
-use datafusion_physical_expr::expressions::DateIntervalExpr;
+use datafusion_common::ScalarValue;
+use datafusion_expr::{expr::GroupingSet, utils::expr_to_columns};
+use datafusion_physical_expr::expressions::Literal;
+use datafusion_sql::utils::window_expr_common_partition_keys;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
+use itertools::Itertools;
 use log::{debug, trace};
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::sync::Arc;
 
 fn create_function_physical_name(
@@ -115,13 +115,13 @@ fn create_physical_name(e: &Expr, is_first_expr: bool) -> Result<String> {
         } => {
             let mut name = "CASE ".to_string();
             if let Some(e) = expr {
-                name += &format!("{:?} ", e);
+                let _ = write!(name, "{:?} ", e);
             }
             for (w, t) in when_then_expr {
-                name += &format!("WHEN {:?} THEN {:?} ", w, t);
+                let _ = write!(name, "WHEN {:?} THEN {:?} ", w, t);
             }
             if let Some(e) = else_expr {
-                name += &format!("ELSE {:?} ", e);
+                let _ = write!(name, "ELSE {:?} ", e);
             }
             name += "END";
             Ok(name)
@@ -379,7 +379,7 @@ impl DefaultPhysicalPlanner {
                     source,
                     projection,
                     filters,
-                    limit,
+                    fetch,
                     ..
                 }) => {
                     let source = source_as_provider(source)?;
@@ -388,7 +388,7 @@ impl DefaultPhysicalPlanner {
                     // referred to in the query
                     let filters = unnormalize_cols(filters.iter().cloned());
                     let unaliased: Vec<Expr> = filters.into_iter().map(unalias).collect();
-                    source.scan(projection, &unaliased, *limit).await
+                    source.scan(session_state, projection, &unaliased, *fetch).await
                 }
                 LogicalPlan::Values(Values {
                     values,
@@ -538,20 +538,12 @@ impl DefaultPhysicalPlanner {
                     let physical_input_schema = input_exec.schema();
                     let logical_input_schema = input.as_ref().schema();
 
-                    let groups = group_expr
-                        .iter()
-                        .map(|e| {
-                            tuple_err((
-                                self.create_physical_expr(
-                                    e,
-                                    logical_input_schema,
-                                    &physical_input_schema,
-                                    session_state,
-                                ),
-                                physical_name(e),
-                            ))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
+                    let groups = self.create_grouping_physical_expr(
+                        group_expr,
+                        logical_input_schema,
+                        &physical_input_schema,
+                        session_state)?;
+
                     let aggregates = aggr_expr
                         .iter()
                         .map(|e| {
@@ -577,6 +569,7 @@ impl DefaultPhysicalPlanner {
 
                     // TODO: dictionary type not yet supported in Hash Repartition
                     let contains_dict = groups
+                        .expr()
                         .iter()
                         .flat_map(|x| x.0.data_type(physical_input_schema.as_ref()))
                         .any(|x| matches!(x, DataType::Dictionary(_, _)));
@@ -606,13 +599,17 @@ impl DefaultPhysicalPlanner {
                         (initial_aggr, AggregateMode::Final)
                     };
 
-                    Ok(Arc::new(AggregateExec::try_new(
-                        next_partition_mode,
+                    let final_grouping_set = PhysicalGroupBy::new_single(
                         final_group
                             .iter()
                             .enumerate()
-                            .map(|(i, expr)| (expr.clone(), groups[i].1.clone()))
-                            .collect(),
+                            .map(|(i, expr)| (expr.clone(), groups.expr()[i].1.clone()))
+                            .collect()
+                    );
+
+                    Ok(Arc::new(AggregateExec::try_new(
+                        next_partition_mode,
+                        final_grouping_set,
                         aggregates,
                         initial_aggr,
                         physical_input_schema.clone(),
@@ -755,6 +752,7 @@ impl DefaultPhysicalPlanner {
                     left,
                     right,
                     on: keys,
+                    filter,
                     join_type,
                     null_equals_null,
                     ..
@@ -772,6 +770,65 @@ impl DefaultPhysicalPlanner {
                             ))
                         })
                         .collect::<Result<join_utils::JoinOn>>()?;
+
+                    let join_filter = match filter {
+                        Some(expr) => {
+                            // Extract columns from filter expression
+                            let mut cols = HashSet::new();
+                            expr_to_columns(expr, &mut cols)?;
+
+                            // Collect left & right field indices
+                            let left_field_indices = cols.iter()
+                                .filter_map(|c| match left_df_schema.index_of_column(c) {
+                                    Ok(idx) => Some(idx),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>();
+                            let right_field_indices = cols.iter()
+                                .filter_map(|c| match right_df_schema.index_of_column(c) {
+                                    Ok(idx) => Some(idx),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>();
+
+                            // Collect DFFields and Fields required for intermediate schemas
+                            let (filter_df_fields, filter_fields): (Vec<_>, Vec<_>) = left_field_indices.clone()
+                                .into_iter()
+                                .map(|i| (
+                                    left_df_schema.field(i).clone(),
+                                    physical_left.schema().field(i).clone(),
+                                ))
+                                .chain(
+                                    right_field_indices.clone()
+                                        .into_iter()
+                                        .map(|i| (
+                                            right_df_schema.field(i).clone(),
+                                            physical_right.schema().field(i).clone(),
+                                        ))
+                                )
+                                .unzip();
+
+
+                            // Construct intermediate schemas used for filtering data and
+                            // convert logical expression to physical according to filter schema
+                            let filter_df_schema = DFSchema::new_with_metadata(filter_df_fields, HashMap::new())?;
+                            let filter_schema = Schema::new_with_metadata(filter_fields, HashMap::new());
+                            let filter_expr = create_physical_expr(
+                                expr,
+                                &filter_df_schema,
+                                &filter_schema,
+                                &session_state.execution_props
+                            )?;
+                            let column_indices = join_utils::JoinFilter::build_column_indices(left_field_indices, right_field_indices);
+
+                            Some(join_utils::JoinFilter::new(
+                                filter_expr,
+                                column_indices,
+                                filter_schema
+                            ))
+                        }
+                        _ => None
+                    };
 
                     if session_state.config.target_partitions > 1
                         && session_state.config.repartition_joins
@@ -803,6 +860,7 @@ impl DefaultPhysicalPlanner {
                                 ),
                             )?),
                             join_on,
+                            join_filter,
                             join_type,
                             PartitionMode::Partitioned,
                             null_equals_null,
@@ -812,6 +870,7 @@ impl DefaultPhysicalPlanner {
                             physical_left,
                             physical_right,
                             join_on,
+                            join_filter,
                             join_type,
                             PartitionMode::CollectLeft,
                             null_equals_null,
@@ -839,8 +898,7 @@ impl DefaultPhysicalPlanner {
                         _ => Err(DataFusionError::Plan("SubqueryAlias should only wrap TableScan".to_string()))
                     }
                 }
-                LogicalPlan::Limit(Limit { input, n, .. }) => {
-                    let limit = *n;
+                LogicalPlan::Limit(Limit { input, skip, fetch,.. }) => {
                     let input = self.create_initial_plan(input, session_state).await?;
 
                     // GlobalLimitExec requires a single partition for input
@@ -849,15 +907,14 @@ impl DefaultPhysicalPlanner {
                     } else {
                         // Apply a LocalLimitExec to each partition. The optimizer will also insert
                         // a CoalescePartitionsExec between the GlobalLimitExec and LocalLimitExec
-                        Arc::new(LocalLimitExec::new(input, limit))
+                        if let Some(fetch) = fetch {
+                            Arc::new(LocalLimitExec::new(input, *fetch + skip.unwrap_or(0)))
+                        } else {
+                            input
+                        }
                     };
 
-                    Ok(Arc::new(GlobalLimitExec::new(input, limit)))
-                }
-                LogicalPlan::Offset(_) => {
-                    Err(DataFusionError::Internal(
-                        "Unsupported logical plan: OFFSET".to_string(),
-                    ))
+                    Ok(Arc::new(GlobalLimitExec::new(input, *skip, *fetch)))
                 }
                 LogicalPlan::CreateExternalTable(_) => {
                     // There is no default plan for "CREATE EXTERNAL
@@ -944,309 +1001,261 @@ impl DefaultPhysicalPlanner {
             exec_plan
         }.boxed()
     }
-}
 
-/// Create a physical expression from a logical expression ([Expr])
-pub fn create_physical_expr(
-    e: &Expr,
-    input_dfschema: &DFSchema,
-    input_schema: &Schema,
-    execution_props: &ExecutionProps,
-) -> Result<Arc<dyn PhysicalExpr>> {
-    match e {
-        Expr::Alias(expr, ..) => Ok(create_physical_expr(
-            expr,
-            input_dfschema,
-            input_schema,
-            execution_props,
-        )?),
-        Expr::Column(c) => {
-            let idx = input_dfschema.index_of_column(c)?;
-            Ok(Arc::new(Column::new(&c.name, idx)))
-        }
-        Expr::Literal(value) => Ok(Arc::new(Literal::new(value.clone()))),
-        Expr::ScalarVariable(_, variable_names) => {
-            if &variable_names[0][0..2] == "@@" {
-                match execution_props.get_var_provider(VarType::System) {
-                    Some(provider) => {
-                        let scalar_value = provider.get_value(variable_names.clone())?;
-                        Ok(Arc::new(Literal::new(scalar_value)))
-                    }
-                    _ => Err(DataFusionError::Plan(
-                        "No system variable provider found".to_string(),
-                    )),
-                }
-            } else {
-                match execution_props.get_var_provider(VarType::UserDefined) {
-                    Some(provider) => {
-                        let scalar_value = provider.get_value(variable_names.clone())?;
-                        Ok(Arc::new(Literal::new(scalar_value)))
-                    }
-                    _ => Err(DataFusionError::Plan(
-                        "No user defined variable provider found".to_string(),
-                    )),
-                }
-            }
-        }
-        Expr::BinaryExpr { left, op, right } => {
-            let lhs = create_physical_expr(
-                left,
-                input_dfschema,
-                input_schema,
-                execution_props,
-            )?;
-            let rhs = create_physical_expr(
-                right,
-                input_dfschema,
-                input_schema,
-                execution_props,
-            )?;
-            match (
-                lhs.data_type(input_schema)?,
-                op,
-                rhs.data_type(input_schema)?,
-            ) {
-                (
-                    DataType::Date32 | DataType::Date64,
-                    Operator::Plus | Operator::Minus,
-                    DataType::Interval(_),
-                ) => Ok(Arc::new(DateIntervalExpr::try_new(
-                    lhs,
-                    *op,
-                    rhs,
-                    input_schema,
-                )?)),
-                _ => {
-                    // assume that we can coerce both sides into a common type
-                    // and then perform a binary operation
-                    binary(lhs, *op, rhs, input_schema)
-                }
-            }
-        }
-        Expr::Case {
-            expr,
-            when_then_expr,
-            else_expr,
-            ..
-        } => {
-            let expr: Option<Arc<dyn PhysicalExpr>> = if let Some(e) = expr {
-                Some(create_physical_expr(
-                    e.as_ref(),
-                    input_dfschema,
-                    input_schema,
-                    execution_props,
-                )?)
-            } else {
-                None
-            };
-            let when_expr = when_then_expr
-                .iter()
-                .map(|(w, _)| {
-                    create_physical_expr(
-                        w.as_ref(),
+    fn create_grouping_physical_expr(
+        &self,
+        group_expr: &[Expr],
+        input_dfschema: &DFSchema,
+        input_schema: &Schema,
+        session_state: &SessionState,
+    ) -> Result<PhysicalGroupBy> {
+        if group_expr.len() == 1 {
+            match &group_expr[0] {
+                Expr::GroupingSet(GroupingSet::GroupingSets(grouping_sets)) => {
+                    merge_grouping_set_physical_expr(
+                        grouping_sets,
                         input_dfschema,
                         input_schema,
-                        execution_props,
+                        session_state,
                     )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let then_expr = when_then_expr
-                .iter()
-                .map(|(_, t)| {
-                    create_physical_expr(
-                        t.as_ref(),
+                }
+                Expr::GroupingSet(GroupingSet::Cube(exprs)) => create_cube_physical_expr(
+                    exprs,
+                    input_dfschema,
+                    input_schema,
+                    session_state,
+                ),
+                Expr::GroupingSet(GroupingSet::Rollup(exprs)) => {
+                    create_rollup_physical_expr(
+                        exprs,
                         input_dfschema,
                         input_schema,
-                        execution_props,
+                        session_state,
                     )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let when_then_expr: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> =
-                when_expr
+                }
+                expr => Ok(PhysicalGroupBy::new_single(vec![tuple_err((
+                    self.create_physical_expr(
+                        expr,
+                        input_dfschema,
+                        input_schema,
+                        session_state,
+                    ),
+                    physical_name(expr),
+                ))?])),
+            }
+        } else {
+            Ok(PhysicalGroupBy::new_single(
+                group_expr
                     .iter()
-                    .zip(then_expr.iter())
-                    .map(|(w, t)| (w.clone(), t.clone()))
-                    .collect();
-            let else_expr: Option<Arc<dyn PhysicalExpr>> = if let Some(e) = else_expr {
-                Some(create_physical_expr(
-                    e.as_ref(),
-                    input_dfschema,
-                    input_schema,
-                    execution_props,
-                )?)
-            } else {
-                None
-            };
-            Ok(Arc::new(CaseExpr::try_new(
-                expr,
-                &when_then_expr,
-                else_expr,
-            )?))
-        }
-        Expr::Cast { expr, data_type } => expressions::cast(
-            create_physical_expr(expr, input_dfschema, input_schema, execution_props)?,
-            input_schema,
-            data_type.clone(),
-        ),
-        Expr::TryCast { expr, data_type } => expressions::try_cast(
-            create_physical_expr(expr, input_dfschema, input_schema, execution_props)?,
-            input_schema,
-            data_type.clone(),
-        ),
-        Expr::Not(expr) => expressions::not(create_physical_expr(
-            expr,
-            input_dfschema,
-            input_schema,
-            execution_props,
-        )?),
-        Expr::Negative(expr) => expressions::negative(
-            create_physical_expr(expr, input_dfschema, input_schema, execution_props)?,
-            input_schema,
-        ),
-        Expr::IsNull(expr) => expressions::is_null(create_physical_expr(
-            expr,
-            input_dfschema,
-            input_schema,
-            execution_props,
-        )?),
-        Expr::IsNotNull(expr) => expressions::is_not_null(create_physical_expr(
-            expr,
-            input_dfschema,
-            input_schema,
-            execution_props,
-        )?),
-        Expr::GetIndexedField { expr, key } => Ok(Arc::new(GetIndexedFieldExpr::new(
-            create_physical_expr(expr, input_dfschema, input_schema, execution_props)?,
-            key.clone(),
-        ))),
-
-        Expr::ScalarFunction { fun, args } => {
-            let physical_args = args
-                .iter()
-                .map(|e| {
-                    create_physical_expr(e, input_dfschema, input_schema, execution_props)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            functions::create_physical_expr(
-                fun,
-                &physical_args,
-                input_schema,
-                execution_props,
-            )
-        }
-        Expr::ScalarUDF { fun, args } => {
-            let mut physical_args = vec![];
-            for e in args {
-                physical_args.push(create_physical_expr(
-                    e,
-                    input_dfschema,
-                    input_schema,
-                    execution_props,
-                )?);
-            }
-
-            udf::create_physical_expr(fun.clone().as_ref(), &physical_args, input_schema)
-        }
-        Expr::Between {
-            expr,
-            negated,
-            low,
-            high,
-        } => {
-            let value_expr = create_physical_expr(
-                expr,
-                input_dfschema,
-                input_schema,
-                execution_props,
-            )?;
-            let low_expr =
-                create_physical_expr(low, input_dfschema, input_schema, execution_props)?;
-            let high_expr = create_physical_expr(
-                high,
-                input_dfschema,
-                input_schema,
-                execution_props,
-            )?;
-
-            // rewrite the between into the two binary operators
-            let binary_expr = binary(
-                binary(value_expr.clone(), Operator::GtEq, low_expr, input_schema)?,
-                Operator::And,
-                binary(value_expr.clone(), Operator::LtEq, high_expr, input_schema)?,
-                input_schema,
-            );
-
-            if *negated {
-                expressions::not(binary_expr?)
-            } else {
-                binary_expr
-            }
-        }
-        Expr::InList {
-            expr,
-            list,
-            negated,
-        } => match expr.as_ref() {
-            Expr::Literal(ScalarValue::Utf8(None)) => {
-                Ok(expressions::lit(ScalarValue::Boolean(None)))
-            }
-            _ => {
-                let value_expr = create_physical_expr(
-                    expr,
-                    input_dfschema,
-                    input_schema,
-                    execution_props,
-                )?;
-                let value_expr_data_type = value_expr.data_type(input_schema)?;
-
-                let list_exprs = list
-                    .iter()
-                    .map(|expr| match expr {
-                        Expr::Literal(ScalarValue::Utf8(None)) => create_physical_expr(
-                            expr,
-                            input_dfschema,
-                            input_schema,
-                            execution_props,
-                        ),
-                        _ => {
-                            let list_expr = create_physical_expr(
-                                expr,
+                    .map(|e| {
+                        tuple_err((
+                            self.create_physical_expr(
+                                e,
                                 input_dfschema,
                                 input_schema,
-                                execution_props,
-                            )?;
-                            let list_expr_data_type =
-                                list_expr.data_type(input_schema)?;
-
-                            if list_expr_data_type == value_expr_data_type {
-                                Ok(list_expr)
-                            } else if can_cast_types(
-                                &list_expr_data_type,
-                                &value_expr_data_type,
-                            ) {
-                                expressions::cast(
-                                    list_expr,
-                                    input_schema,
-                                    value_expr.data_type(input_schema)?,
-                                )
-                            } else {
-                                Err(DataFusionError::Plan(format!(
-                                    "Unsupported CAST from {:?} to {:?}",
-                                    list_expr_data_type, value_expr_data_type
-                                )))
-                            }
-                        }
+                                session_state,
+                            ),
+                            physical_name(e),
+                        ))
                     })
-                    .collect::<Result<Vec<_>>>()?;
-
-                expressions::in_list(value_expr, list_exprs, negated)
-            }
-        },
-        other => Err(DataFusionError::NotImplemented(format!(
-            "Physical plan does not support logical expression {:?}",
-            other
-        ))),
+                    .collect::<Result<Vec<_>>>()?,
+            ))
+        }
     }
+}
+
+/// Expand and align  a GROUPING SET expression.
+/// (see https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS)
+///
+/// This will take a list of grouping sets and ensure that each group is
+/// properly aligned for the physical execution plan. We do this by
+/// identifying all unique expression in each group and conforming each
+/// group to the same set of expression types and ordering.
+/// For example, if we have something like `GROUPING SETS ((a,b,c),(a),(b),(b,c))`
+/// we would expand this to `GROUPING SETS ((a,b,c),(a,NULL,NULL),(NULL,b,NULL),(NULL,b,c))
+/// (see https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS)
+fn merge_grouping_set_physical_expr(
+    grouping_sets: &[Vec<Expr>],
+    input_dfschema: &DFSchema,
+    input_schema: &Schema,
+    session_state: &SessionState,
+) -> Result<PhysicalGroupBy> {
+    let num_groups = grouping_sets.len();
+    let mut all_exprs: Vec<Expr> = vec![];
+    let mut grouping_set_expr: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![];
+    let mut null_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![];
+
+    for expr in grouping_sets.iter().flatten() {
+        if !all_exprs.contains(expr) {
+            all_exprs.push(expr.clone());
+
+            grouping_set_expr.push(get_physical_expr_pair(
+                expr,
+                input_dfschema,
+                input_schema,
+                session_state,
+            )?);
+
+            null_exprs.push(get_null_physical_expr_pair(
+                expr,
+                input_dfschema,
+                input_schema,
+                session_state,
+            )?);
+        }
+    }
+
+    let mut merged_sets: Vec<Vec<bool>> = Vec::with_capacity(num_groups);
+
+    for expr_group in grouping_sets.iter() {
+        let group: Vec<bool> = all_exprs
+            .iter()
+            .map(|expr| !expr_group.contains(expr))
+            .collect();
+
+        merged_sets.push(group)
+    }
+
+    Ok(PhysicalGroupBy::new(
+        grouping_set_expr,
+        null_exprs,
+        merged_sets,
+    ))
+}
+
+/// Expand and align a CUBE expression. This is a special case of GROUPING SETS
+/// (see https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS)
+fn create_cube_physical_expr(
+    exprs: &[Expr],
+    input_dfschema: &DFSchema,
+    input_schema: &Schema,
+    session_state: &SessionState,
+) -> Result<PhysicalGroupBy> {
+    let num_of_exprs = exprs.len();
+    let num_groups = num_of_exprs * num_of_exprs;
+
+    let mut null_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        Vec::with_capacity(num_of_exprs);
+    let mut all_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        Vec::with_capacity(num_of_exprs);
+
+    for expr in exprs {
+        null_exprs.push(get_null_physical_expr_pair(
+            expr,
+            input_dfschema,
+            input_schema,
+            session_state,
+        )?);
+
+        all_exprs.push(get_physical_expr_pair(
+            expr,
+            input_dfschema,
+            input_schema,
+            session_state,
+        )?)
+    }
+
+    let mut groups: Vec<Vec<bool>> = Vec::with_capacity(num_groups);
+
+    groups.push(vec![false; num_of_exprs]);
+
+    for null_count in 1..=num_of_exprs {
+        for null_idx in (0..num_of_exprs).combinations(null_count) {
+            let mut next_group: Vec<bool> = vec![false; num_of_exprs];
+            null_idx.into_iter().for_each(|i| next_group[i] = true);
+            groups.push(next_group);
+        }
+    }
+
+    Ok(PhysicalGroupBy::new(all_exprs, null_exprs, groups))
+}
+
+/// Expand and align a ROLLUP expression. This is a special case of GROUPING SETS
+/// (see https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS)
+fn create_rollup_physical_expr(
+    exprs: &[Expr],
+    input_dfschema: &DFSchema,
+    input_schema: &Schema,
+    session_state: &SessionState,
+) -> Result<PhysicalGroupBy> {
+    let num_of_exprs = exprs.len();
+
+    let mut null_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        Vec::with_capacity(num_of_exprs);
+    let mut all_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        Vec::with_capacity(num_of_exprs);
+
+    let mut groups: Vec<Vec<bool>> = Vec::with_capacity(num_of_exprs + 1);
+
+    for expr in exprs {
+        null_exprs.push(get_null_physical_expr_pair(
+            expr,
+            input_dfschema,
+            input_schema,
+            session_state,
+        )?);
+
+        all_exprs.push(get_physical_expr_pair(
+            expr,
+            input_dfschema,
+            input_schema,
+            session_state,
+        )?)
+    }
+
+    for total in 0..=num_of_exprs {
+        let mut group: Vec<bool> = Vec::with_capacity(num_of_exprs);
+
+        for index in 0..num_of_exprs {
+            if index < total {
+                group.push(false);
+            } else {
+                group.push(true);
+            }
+        }
+
+        groups.push(group)
+    }
+
+    Ok(PhysicalGroupBy::new(all_exprs, null_exprs, groups))
+}
+
+/// For a given logical expr, get a properly typed NULL ScalarValue physical expression
+fn get_null_physical_expr_pair(
+    expr: &Expr,
+    input_dfschema: &DFSchema,
+    input_schema: &Schema,
+    session_state: &SessionState,
+) -> Result<(Arc<dyn PhysicalExpr>, String)> {
+    let physical_expr = create_physical_expr(
+        expr,
+        input_dfschema,
+        input_schema,
+        &session_state.execution_props,
+    )?;
+    let physical_name = physical_name(&expr.clone())?;
+
+    let data_type = physical_expr.data_type(input_schema)?;
+    let null_value: ScalarValue = (&data_type).try_into()?;
+
+    let null_value = Literal::new(null_value);
+    Ok((Arc::new(null_value), physical_name))
+}
+
+fn get_physical_expr_pair(
+    expr: &Expr,
+    input_dfschema: &DFSchema,
+    input_schema: &Schema,
+    session_state: &SessionState,
+) -> Result<(Arc<dyn PhysicalExpr>, String)> {
+    let physical_expr = create_physical_expr(
+        expr,
+        input_dfschema,
+        input_schema,
+        &session_state.execution_props,
+    )?;
+    let physical_name = physical_name(expr)?;
+    Ok((physical_expr, physical_name))
 }
 
 /// Create a window expression with a name from a logical expression
@@ -1543,11 +1552,13 @@ mod tests {
     };
     use crate::prelude::{SessionConfig, SessionContext};
     use crate::scalar::ScalarValue;
+    use crate::test_util::{scan_empty, scan_empty_with_partitions};
     use crate::{
         logical_plan::LogicalPlanBuilder, physical_plan::SendableRecordBatchStream,
     };
     use arrow::datatypes::{DataType, Field, SchemaRef};
     use datafusion_common::{DFField, DFSchema, DFSchemaRef};
+    use datafusion_expr::expr::GroupingSet;
     use datafusion_expr::sum;
     use datafusion_expr::{col, lit};
     use fmt::Debug;
@@ -1578,7 +1589,7 @@ mod tests {
             .project(vec![col("c1"), col("c2")])?
             .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
             .sort(vec![col("c1").sort(true, true)])?
-            .limit(10)?
+            .limit(Some(3), Some(10))?
             .build()?;
 
         let plan = plan(&logical_plan).await?;
@@ -1587,6 +1598,60 @@ mod tests {
         // the cast here is implicit so has CastOptions with safe=true
         let expected = "BinaryExpr { left: Column { name: \"c7\", index: 6 }, op: Lt, right: TryCastExpr { expr: Literal { value: UInt8(5) }, cast_type: Int64 } }";
         assert!(format!("{:?}", plan).contains(expected));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_cube_expr() -> Result<()> {
+        let logical_plan = test_csv_scan().await?.build()?;
+
+        let plan = plan(&logical_plan).await?;
+
+        let exprs = vec![col("c1"), col("c2"), col("c3")];
+
+        let physical_input_schema = plan.schema();
+        let physical_input_schema = physical_input_schema.as_ref();
+        let logical_input_schema = logical_plan.schema();
+        let session_state = make_session_state();
+
+        let cube = create_cube_physical_expr(
+            &exprs,
+            logical_input_schema,
+            physical_input_schema,
+            &session_state,
+        );
+
+        let expected = r#"Ok(PhysicalGroupBy { expr: [(Column { name: "c1", index: 0 }, "c1"), (Column { name: "c2", index: 1 }, "c2"), (Column { name: "c3", index: 2 }, "c3")], null_expr: [(Literal { value: Utf8(NULL) }, "c1"), (Literal { value: Int64(NULL) }, "c2"), (Literal { value: Int64(NULL) }, "c3")], groups: [[false, false, false], [true, false, false], [false, true, false], [false, false, true], [true, true, false], [true, false, true], [false, true, true], [true, true, true]] })"#;
+
+        assert_eq!(format!("{:?}", cube), expected);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_rollup_expr() -> Result<()> {
+        let logical_plan = test_csv_scan().await?.build()?;
+
+        let plan = plan(&logical_plan).await?;
+
+        let exprs = vec![col("c1"), col("c2"), col("c3")];
+
+        let physical_input_schema = plan.schema();
+        let physical_input_schema = physical_input_schema.as_ref();
+        let logical_input_schema = logical_plan.schema();
+        let session_state = make_session_state();
+
+        let rollup = create_rollup_physical_expr(
+            &exprs,
+            logical_input_schema,
+            physical_input_schema,
+            &session_state,
+        );
+
+        let expected = r#"Ok(PhysicalGroupBy { expr: [(Column { name: "c1", index: 0 }, "c1"), (Column { name: "c2", index: 1 }, "c2"), (Column { name: "c3", index: 2 }, "c3")], null_expr: [(Literal { value: Utf8(NULL) }, "c1"), (Literal { value: Int64(NULL) }, "c2"), (Literal { value: Int64(NULL) }, "c3")], groups: [[true, true, true], [false, true, true], [false, false, true], [false, false, false]] })"#;
+
+        assert_eq!(format!("{:?}", rollup), expected);
 
         Ok(())
     }
@@ -1616,14 +1681,44 @@ mod tests {
         let logical_plan = test_csv_scan()
             .await?
             .filter(col("c7").lt(col("c12")))?
+            .limit(Some(3), None)?
             .build()?;
 
         let plan = plan(&logical_plan).await?;
 
         // c12 is f64, c7 is u8 -> cast c7 to f64
         // the cast here is implicit so has CastOptions with safe=true
-        let expected = "predicate: BinaryExpr { left: TryCastExpr { expr: Column { name: \"c7\", index: 6 }, cast_type: Float64 }, op: Lt, right: Column { name: \"c12\", index: 11 } }";
-        assert!(format!("{:?}", plan).contains(expected));
+        let _expected = "predicate: BinaryExpr { left: TryCastExpr { expr: Column { name: \"c7\", index: 6 }, cast_type: Float64 }, op: Lt, right: Column { name: \"c12\", index: 11 } }";
+        let plan_debug_str = format!("{:?}", plan);
+        assert!(plan_debug_str.contains("GlobalLimitExec"));
+        assert!(plan_debug_str.contains("skip: Some(3)"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_with_zero_offset_plan() -> Result<()> {
+        let logical_plan = test_csv_scan().await?.limit(Some(0), None)?.build()?;
+        let plan = plan(&logical_plan).await?;
+        assert!(format!("{:?}", plan).contains("GlobalLimitExec"));
+        assert!(format!("{:?}", plan).contains("skip: Some(0)"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_limit_with_partitions() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+
+        let logical_plan = scan_empty_with_partitions(Some("test"), &schema, None, 2)?
+            .limit(Some(3), Some(5))?
+            .build()?;
+        let plan = plan(&logical_plan).await?;
+
+        assert!(format!("{:?}", plan).contains("GlobalLimitExec"));
+        assert!(format!("{:?}", plan).contains("skip: Some(3), fetch: Some(5)"));
+
+        // LocalLimitExec adjusts the `fetch`
+        assert!(format!("{:?}", plan).contains("LocalLimitExec"));
+        assert!(format!("{:?}", plan).contains("fetch: 8"));
         Ok(())
     }
 
@@ -1836,6 +1931,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hash_agg_grouping_set_input_schema() -> Result<()> {
+        let grouping_set_expr = Expr::GroupingSet(GroupingSet::GroupingSets(vec![
+            vec![col("c1")],
+            vec![col("c2")],
+            vec![col("c1"), col("c2")],
+        ]));
+        let logical_plan = test_csv_scan_with_name("aggregate_test_100")
+            .await?
+            .aggregate(vec![grouping_set_expr], vec![sum(col("c3"))])?
+            .build()?;
+
+        let execution_plan = plan(&logical_plan).await?;
+        let final_hash_agg = execution_plan
+            .as_any()
+            .downcast_ref::<AggregateExec>()
+            .expect("hash aggregate");
+        assert_eq!(
+            "SUM(aggregate_test_100.c3)",
+            final_hash_agg.schema().field(2).name()
+        );
+        // we need access to the input to the partial aggregate so that other projects can
+        // implement serde
+        assert_eq!("c3", final_hash_agg.input_schema().field(2).name());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn hash_agg_group_by_partitioned() -> Result<()> {
         let logical_plan = test_csv_scan()
             .await?
@@ -1853,16 +1976,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hash_agg_grouping_set_by_partitioned() -> Result<()> {
+        let grouping_set_expr = Expr::GroupingSet(GroupingSet::GroupingSets(vec![
+            vec![col("c1")],
+            vec![col("c2")],
+            vec![col("c1"), col("c2")],
+        ]));
+        let logical_plan = test_csv_scan()
+            .await?
+            .aggregate(vec![grouping_set_expr], vec![sum(col("c3"))])?
+            .build()?;
+
+        let execution_plan = plan(&logical_plan).await?;
+        let formatted = format!("{:?}", execution_plan);
+
+        // Make sure the plan contains a FinalPartitioned, which means it will not use the Final
+        // mode in Aggregate (which is slower)
+        assert!(formatted.contains("FinalPartitioned"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_explain() {
         let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
 
-        let logical_plan =
-            LogicalPlanBuilder::scan_empty(Some("employee"), &schema, None)
-                .unwrap()
-                .explain(true, false)
-                .unwrap()
-                .build()
-                .unwrap();
+        let logical_plan = scan_empty(Some("employee"), &schema, None)
+            .unwrap()
+            .explain(true, false)
+            .unwrap()
+            .build()
+            .unwrap();
 
         let plan = plan(&logical_plan).await.unwrap();
         if let Some(plan) = plan.as_any().downcast_ref::<ExplainExec>() {

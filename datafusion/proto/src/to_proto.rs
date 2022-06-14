@@ -19,28 +19,24 @@
 //! DataFusion logical plans to be serialized and transmitted between
 //! processes.
 
-use crate::protobuf;
-use crate::protobuf::plan_type::PlanTypeEnum::{
-    FinalLogicalPlan, FinalPhysicalPlan, InitialLogicalPlan, InitialPhysicalPlan,
-    OptimizedLogicalPlan, OptimizedPhysicalPlan,
-};
 use crate::protobuf::{
-    EmptyMessage, OptimizedLogicalPlanType, OptimizedPhysicalPlanType,
+    self,
+    plan_type::PlanTypeEnum::{
+        FinalLogicalPlan, FinalPhysicalPlan, InitialLogicalPlan, InitialPhysicalPlan,
+        OptimizedLogicalPlan, OptimizedPhysicalPlan,
+    },
+    CubeNode, EmptyMessage, GroupingSetNode, LogicalExprList, OptimizedLogicalPlanType,
+    OptimizedPhysicalPlanType, RollupNode,
 };
-
-use datafusion::logical_plan::plan::StringifiedPlan;
-use datafusion::logical_plan::PlanType;
-use datafusion::{
-    arrow::datatypes::{
-        DataType, Field, IntervalUnit, Schema, SchemaRef, TimeUnit, UnionMode,
-    },
-    logical_expr::{BuiltInWindowFunction, BuiltinScalarFunction, WindowFunction},
-    logical_plan::{
-        window_frames::{WindowFrame, WindowFrameBound, WindowFrameUnits},
-        Column, DFField, DFSchemaRef, Expr,
-    },
-    physical_plan::aggregates::AggregateFunction,
-    scalar::ScalarValue,
+use arrow::datatypes::{
+    DataType, Field, IntervalUnit, Schema, SchemaRef, TimeUnit, UnionMode,
+};
+use datafusion_common::{Column, DFField, DFSchemaRef, ScalarValue};
+use datafusion_expr::expr::GroupingSet;
+use datafusion_expr::{
+    logical_plan::PlanType, logical_plan::StringifiedPlan, AggregateFunction,
+    BuiltInWindowFunction, BuiltinScalarFunction, Expr, WindowFrame, WindowFrameBound,
+    WindowFrameUnits, WindowFunction,
 };
 
 #[derive(Debug)]
@@ -206,17 +202,15 @@ impl From<&DataType> for protobuf::arrow_type::ArrowTypeEnum {
                     .map(|field| field.into())
                     .collect::<Vec<_>>(),
             }),
-            DataType::Union(union_types, union_mode) => {
+            DataType::Union(union_types, type_ids, union_mode) => {
                 let union_mode = match union_mode {
                     UnionMode::Sparse => protobuf::UnionMode::Sparse,
                     UnionMode::Dense => protobuf::UnionMode::Dense,
                 };
                 Self::Union(protobuf::Union {
-                    union_types: union_types
-                        .iter()
-                        .map(|field| field.into())
-                        .collect::<Vec<_>>(),
+                    union_types: union_types.iter().map(Into::into).collect(),
                     union_mode: union_mode.into(),
+                    type_ids: type_ids.iter().map(|x| *x as i32).collect(),
                 })
             }
             DataType::Dictionary(key_type, value_type) => {
@@ -713,7 +707,55 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
             Expr::Wildcard => Self {
                 expr_type: Some(ExprType::Wildcard(true)),
             },
-            _ => unimplemented!(),
+            Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {
+                // we would need to add logical plan operators to datafusion.proto to support this
+                // see discussion in https://github.com/apache/arrow-datafusion/issues/2565
+                unimplemented!("subquery expressions are not supported yet")
+            }
+            Expr::GetIndexedField { key, expr } => Self {
+                expr_type: Some(ExprType::GetIndexedField(Box::new(
+                    protobuf::GetIndexedField {
+                        key: Some(key.try_into()?),
+                        expr: Some(Box::new(expr.as_ref().try_into()?)),
+                    },
+                ))),
+            },
+
+            Expr::GroupingSet(GroupingSet::Cube(exprs)) => Self {
+                expr_type: Some(ExprType::Cube(CubeNode {
+                    expr: exprs.iter().map(|expr| expr.try_into()).collect::<Result<
+                        Vec<_>,
+                        Self::Error,
+                    >>(
+                    )?,
+                })),
+            },
+            Expr::GroupingSet(GroupingSet::Rollup(exprs)) => Self {
+                expr_type: Some(ExprType::Rollup(RollupNode {
+                    expr: exprs.iter().map(|expr| expr.try_into()).collect::<Result<
+                        Vec<_>,
+                        Self::Error,
+                    >>(
+                    )?,
+                })),
+            },
+            Expr::GroupingSet(GroupingSet::GroupingSets(exprs)) => Self {
+                expr_type: Some(ExprType::GroupingSet(GroupingSetNode {
+                    expr: exprs
+                        .iter()
+                        .map(|expr_list| {
+                            Ok(LogicalExprList {
+                                expr: expr_list
+                                    .iter()
+                                    .map(|expr| expr.try_into())
+                                    .collect::<Result<Vec<_>, Self::Error>>()?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, Self::Error>>()?,
+                })),
+            },
+
+            Expr::QualifiedWildcard { .. } | Expr::TryCast { .. } => unimplemented!(),
         };
 
         Ok(expr_node)
@@ -724,7 +766,7 @@ impl TryFrom<&ScalarValue> for protobuf::ScalarValue {
     type Error = Error;
 
     fn try_from(val: &ScalarValue) -> Result<Self, Self::Error> {
-        use datafusion::scalar;
+        use datafusion_common::scalar;
         use protobuf::{scalar_value::Value, PrimitiveScalarType};
 
         let scalar_val = match val {
@@ -1186,7 +1228,7 @@ impl TryFrom<&DataType> for protobuf::scalar_type::Datatype {
             | DataType::FixedSizeList(_, _)
             | DataType::LargeList(_)
             | DataType::Struct(_)
-            | DataType::Union(_, _)
+            | DataType::Union(_, _, _)
             | DataType::Dictionary(_, _)
             | DataType::Map(_, _)
             | DataType::Decimal(_, _) => {

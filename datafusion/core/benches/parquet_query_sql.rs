@@ -145,7 +145,7 @@ where
 
 fn generate_file() -> NamedTempFile {
     let now = Instant::now();
-    let named_file = tempfile::Builder::new()
+    let mut named_file = tempfile::Builder::new()
         .prefix("parquet_query_sql")
         .suffix(".parquet")
         .tempfile()
@@ -159,8 +159,8 @@ fn generate_file() -> NamedTempFile {
         .set_max_row_group_size(ROW_GROUP_SIZE)
         .build();
 
-    let file = named_file.as_file().try_clone().unwrap();
-    let mut writer = ArrowWriter::try_new(file, schema, Some(properties)).unwrap();
+    let mut writer =
+        ArrowWriter::try_new(&mut named_file, schema, Some(properties)).unwrap();
 
     for _ in 0..NUM_BATCHES {
         let batch = generate_batch();
@@ -260,8 +260,9 @@ fn criterion_benchmark(c: &mut Criterion) {
                 local_rt.block_on(async {
                     let query = context.sql(&query).await.unwrap();
                     let plan = query.create_physical_plan().await.unwrap();
-                    let mut stream =
-                        scheduler.schedule(plan, context.task_ctx()).unwrap();
+                    let results = scheduler.schedule(plan, context.task_ctx()).unwrap();
+
+                    let mut stream = results.stream();
                     while stream.next().await.transpose().unwrap().is_some() {}
                 });
             });

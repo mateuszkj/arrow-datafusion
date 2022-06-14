@@ -31,6 +31,7 @@ use datafusion_common::Column;
 use datafusion_common::{DFSchema, Result};
 use datafusion_common::{DataFusionError, ScalarValue};
 use std::fmt;
+use std::fmt::Write;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::ops::Not;
 use std::sync::Arc;
@@ -269,6 +270,27 @@ pub enum GroupingSet {
     GroupingSets(Vec<Vec<Expr>>),
 }
 
+impl GroupingSet {
+    /// Return all distinct exprs in the grouping set. For `CUBE` and `ROLLUP` this
+    /// is just the underlying list of exprs. For `GROUPING SET` we need to deduplicate
+    /// the exprs in the underlying sets.
+    pub fn distinct_expr(&self) -> Vec<Expr> {
+        match self {
+            GroupingSet::Rollup(exprs) => exprs.clone(),
+            GroupingSet::Cube(exprs) => exprs.clone(),
+            GroupingSet::GroupingSets(groups) => {
+                let mut exprs: Vec<Expr> = vec![];
+                for exp in groups.iter().flatten() {
+                    if !exprs.contains(exp) {
+                        exprs.push(exp.clone());
+                    }
+                }
+                exprs
+            }
+        }
+    }
+}
+
 /// Fixed seed for the hashing so that Ords are consistent across runs
 const SEED: ahash::RandomState = ahash::RandomState::with_seeds(0, 0, 0, 0);
 
@@ -292,6 +314,40 @@ impl Expr {
     /// This represents how a column with this expression is named when no alias is chosen
     pub fn name(&self, input_schema: &DFSchema) -> Result<String> {
         create_name(self, input_schema)
+    }
+
+    /// Return String representation of the variant represented by `self`
+    /// Useful for non-rust based bindings
+    pub fn variant_name(&self) -> &str {
+        match self {
+            Expr::AggregateFunction { .. } => "AggregateFunction",
+            Expr::AggregateUDF { .. } => "AggregateUDF",
+            Expr::Alias(..) => "Alias",
+            Expr::Between { .. } => "Between",
+            Expr::BinaryExpr { .. } => "BinaryExpr",
+            Expr::Case { .. } => "Case",
+            Expr::Cast { .. } => "Cast",
+            Expr::Column(..) => "Column",
+            Expr::Exists { .. } => "Exists",
+            Expr::GetIndexedField { .. } => "GetIndexedField",
+            Expr::GroupingSet(..) => "GroupingSet",
+            Expr::InList { .. } => "InList",
+            Expr::InSubquery { .. } => "InSubquery",
+            Expr::IsNotNull(..) => "IsNotNull",
+            Expr::IsNull(..) => "IsNull",
+            Expr::Literal(..) => "Literal",
+            Expr::Negative(..) => "Negative",
+            Expr::Not(..) => "Not",
+            Expr::QualifiedWildcard { .. } => "QualifiedWildcard",
+            Expr::ScalarFunction { .. } => "ScalarFunction",
+            Expr::ScalarSubquery { .. } => "ScalarSubquery",
+            Expr::ScalarUDF { .. } => "ScalarUDF",
+            Expr::ScalarVariable(..) => "ScalarVariable",
+            Expr::Sort { .. } => "Sort",
+            Expr::TryCast { .. } => "TryCast",
+            Expr::WindowFunction { .. } => "WindowFunction",
+            Expr::Wildcard => "Wildcard",
+        }
     }
 
     /// Return `self == other`
@@ -681,16 +737,16 @@ fn create_name(e: &Expr, input_schema: &DFSchema) -> Result<String> {
             let mut name = "CASE ".to_string();
             if let Some(e) = expr {
                 let e = create_name(e, input_schema)?;
-                name += &format!("{} ", e);
+                let _ = write!(name, "{} ", e);
             }
             for (w, t) in when_then_expr {
                 let when = create_name(w, input_schema)?;
                 let then = create_name(t, input_schema)?;
-                name += &format!("WHEN {} THEN {} ", when, then);
+                let _ = write!(name, "WHEN {} THEN {} ", when, then);
             }
             if let Some(e) = else_expr {
                 let e = create_name(e, input_schema)?;
-                name += &format!("ELSE {} ", e);
+                let _ = write!(name, "ELSE {} ", e);
             }
             name += "END";
             Ok(name)

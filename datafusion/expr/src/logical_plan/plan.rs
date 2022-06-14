@@ -71,10 +71,8 @@ pub enum LogicalPlan {
     Subquery(Subquery),
     /// Aliased relation provides, or changes, the name of a relation.
     SubqueryAlias(SubqueryAlias),
-    /// Produces the first `n` tuples from its input and discards the rest.
+    /// Skip some number of rows, and then fetch some number of rows.
     Limit(Limit),
-    /// Adjusts the starting point at which the rest of the expressions begin to effect
-    Offset(Offset),
     /// Creates an external table.
     CreateExternalTable(CreateExternalTable),
     /// Creates an in memory table.
@@ -119,7 +117,6 @@ impl LogicalPlan {
             LogicalPlan::CrossJoin(CrossJoin { schema, .. }) => schema,
             LogicalPlan::Repartition(Repartition { input, .. }) => input.schema(),
             LogicalPlan::Limit(Limit { input, .. }) => input.schema(),
-            LogicalPlan::Offset(Offset { input, .. }) => input.schema(),
             LogicalPlan::Subquery(Subquery { subquery, .. }) => subquery.schema(),
             LogicalPlan::SubqueryAlias(SubqueryAlias { schema, .. }) => schema,
             LogicalPlan::CreateExternalTable(CreateExternalTable { schema, .. }) => {
@@ -190,7 +187,6 @@ impl LogicalPlan {
             | LogicalPlan::Sort(Sort { input, .. })
             | LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. })
             | LogicalPlan::CreateView(CreateView { input, .. })
-            | LogicalPlan::Offset(Offset { input, .. })
             | LogicalPlan::Filter(Filter { input, .. }) => input.all_schemas(),
             LogicalPlan::DropTable(_) => vec![],
         }
@@ -227,9 +223,15 @@ impl LogicalPlan {
                 aggr_expr,
                 ..
             }) => group_expr.iter().chain(aggr_expr.iter()).cloned().collect(),
-            LogicalPlan::Join(Join { on, .. }) => on
+            LogicalPlan::Join(Join { on, filter, .. }) => on
                 .iter()
                 .flat_map(|(l, r)| vec![Expr::Column(l.clone()), Expr::Column(r.clone())])
+                .chain(
+                    filter
+                        .as_ref()
+                        .map(|expr| vec![expr.clone()])
+                        .unwrap_or_default(),
+                )
                 .collect(),
             LogicalPlan::Sort(Sort { expr, .. }) => expr.clone(),
             LogicalPlan::Extension(extension) => extension.node.expressions(),
@@ -239,7 +241,6 @@ impl LogicalPlan {
             | LogicalPlan::Subquery(_)
             | LogicalPlan::SubqueryAlias(_)
             | LogicalPlan::Limit(_)
-            | LogicalPlan::Offset(_)
             | LogicalPlan::CreateExternalTable(_)
             | LogicalPlan::CreateMemoryTable(_)
             | LogicalPlan::CreateView(_)
@@ -268,7 +269,6 @@ impl LogicalPlan {
             LogicalPlan::Join(Join { left, right, .. }) => vec![left, right],
             LogicalPlan::CrossJoin(CrossJoin { left, right, .. }) => vec![left, right],
             LogicalPlan::Limit(Limit { input, .. }) => vec![input],
-            LogicalPlan::Offset(Offset { input, .. }) => vec![input],
             LogicalPlan::Subquery(Subquery { subquery, .. }) => vec![subquery],
             LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => vec![input],
             LogicalPlan::Extension(extension) => extension.node.inputs(),
@@ -409,7 +409,6 @@ impl LogicalPlan {
                 true
             }
             LogicalPlan::Limit(Limit { input, .. }) => input.accept(visitor)?,
-            LogicalPlan::Offset(Offset { input, .. }) => input.accept(visitor)?,
             LogicalPlan::Subquery(Subquery { subquery, .. }) => {
                 subquery.accept(visitor)?
             }
@@ -462,21 +461,20 @@ impl LogicalPlan {
     ///       CsvScan: employee projection=Some([0, 3])
     /// ```
     ///
-    /// ```ignore
+    /// ```
     /// use arrow::datatypes::{Field, Schema, DataType};
-    /// use datafusion::logical_plan::{lit, col, LogicalPlanBuilder};
+    /// use datafusion_expr::{lit, col, LogicalPlanBuilder, logical_plan::table_scan};
     /// let schema = Schema::new(vec![
     ///     Field::new("id", DataType::Int32, false),
     /// ]);
-    /// let plan = LogicalPlanBuilder::scan_empty(Some("foo_csv"), &schema, None).unwrap()
+    /// let plan = table_scan(Some("t1"), &schema, None).unwrap()
     ///     .filter(col("id").eq(lit(5))).unwrap()
     ///     .build().unwrap();
     ///
     /// // Format using display_indent
     /// let display_string = format!("{}", plan.display_indent());
     ///
-    /// assert_eq!("Filter: #foo_csv.id = Int32(5)\
-    ///              \n  TableScan: foo_csv projection=None",
+    /// assert_eq!("Filter: #t1.id = Int32(5)\n  TableScan: t1 projection=None",
     ///             display_string);
     /// ```
     pub fn display_indent(&self) -> impl fmt::Display + '_ {
@@ -503,21 +501,21 @@ impl LogicalPlan {
     ///      TableScan: employee projection=Some([0, 3]) [id:Int32, state:Utf8]";
     /// ```
     ///
-    /// ```ignore
+    /// ```
     /// use arrow::datatypes::{Field, Schema, DataType};
-    /// use datafusion::logical_plan::{lit, col, LogicalPlanBuilder};
+    /// use datafusion_expr::{lit, col, LogicalPlanBuilder, logical_plan::table_scan};
     /// let schema = Schema::new(vec![
     ///     Field::new("id", DataType::Int32, false),
     /// ]);
-    /// let plan = LogicalPlanBuilder::scan_empty(Some("foo_csv"), &schema, None).unwrap()
+    /// let plan = table_scan(Some("t1"), &schema, None).unwrap()
     ///     .filter(col("id").eq(lit(5))).unwrap()
     ///     .build().unwrap();
     ///
     /// // Format using display_indent_schema
     /// let display_string = format!("{}", plan.display_indent_schema());
     ///
-    /// assert_eq!("Filter: #foo_csv.id = Int32(5) [id:Int32]\
-    ///             \n  TableScan: foo_csv projection=None [id:Int32]",
+    /// assert_eq!("Filter: #t1.id = Int32(5) [id:Int32]\
+    ///             \n  TableScan: t1 projection=None [id:Int32]",
     ///             display_string);
     /// ```
     pub fn display_indent_schema(&self) -> impl fmt::Display + '_ {
@@ -543,13 +541,13 @@ impl LogicalPlan {
     /// This currently produces two graphs -- one with the basic
     /// structure, and one with additional details such as schema.
     ///
-    /// ```ignore
+    /// ```
     /// use arrow::datatypes::{Field, Schema, DataType};
-    /// use datafusion::logical_plan::{lit, col, LogicalPlanBuilder};
+    /// use datafusion_expr::{lit, col, LogicalPlanBuilder, logical_plan::table_scan};
     /// let schema = Schema::new(vec![
     ///     Field::new("id", DataType::Int32, false),
     /// ]);
-    /// let plan = LogicalPlanBuilder::scan_empty(Some("foo.csv"), &schema, None).unwrap()
+    /// let plan = table_scan(Some("t1"), &schema, None).unwrap()
     ///     .filter(col("id").eq(lit(5))).unwrap()
     ///     .build().unwrap();
     ///
@@ -602,19 +600,19 @@ impl LogicalPlan {
     /// ```text
     /// Projection: #id
     /// ```
-    /// ```ignore
+    /// ```
     /// use arrow::datatypes::{Field, Schema, DataType};
-    /// use datafusion::logical_plan::{lit, col, LogicalPlanBuilder};
+    /// use datafusion_expr::{lit, col, LogicalPlanBuilder, logical_plan::table_scan};
     /// let schema = Schema::new(vec![
     ///     Field::new("id", DataType::Int32, false),
     /// ]);
-    /// let plan = LogicalPlanBuilder::scan_empty(Some("foo.csv"), &schema, None).unwrap()
+    /// let plan = table_scan(Some("t1"), &schema, None).unwrap()
     ///     .build().unwrap();
     ///
     /// // Format using display
     /// let display_string = format!("{}", plan.display());
     ///
-    /// assert_eq!("TableScan: foo.csv projection=None", display_string);
+    /// assert_eq!("TableScan: t1 projection=None", display_string);
     /// ```
     pub fn display(&self) -> impl fmt::Display + '_ {
         // Boilerplate structure to wrap LogicalPlan with something
@@ -622,7 +620,7 @@ impl LogicalPlan {
         struct Wrapper<'a>(&'a LogicalPlan);
         impl<'a> fmt::Display for Wrapper<'a> {
             fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                match &*self.0 {
+                match self.0 {
                     LogicalPlan::EmptyRelation(_) => write!(f, "EmptyRelation"),
                     LogicalPlan::Values(Values { ref values, .. }) => {
                         let str_values: Vec<_> = values
@@ -648,13 +646,25 @@ impl LogicalPlan {
                         ref table_name,
                         ref projection,
                         ref filters,
-                        ref limit,
+                        ref fetch,
                         ..
                     }) => {
+                        let projected_fields = match projection {
+                            Some(indices) => {
+                                let schema = source.schema();
+                                let names: Vec<&str> = indices
+                                    .iter()
+                                    .map(|i| schema.field(*i).name().as_str())
+                                    .collect();
+                                format!("Some([{}])", names.join(", "))
+                            }
+                            _ => "None".to_string(),
+                        };
+
                         write!(
                             f,
-                            "TableScan: {} projection={:?}",
-                            table_name, projection
+                            "TableScan: {} projection={}",
+                            table_name, projected_fields
                         )?;
 
                         if !filters.is_empty() {
@@ -693,8 +703,8 @@ impl LogicalPlan {
                             }
                         }
 
-                        if let Some(n) = limit {
-                            write!(f, ", limit={}", n)?;
+                        if let Some(n) = fetch {
+                            write!(f, ", fetch={}", n)?;
                         }
 
                         Ok(())
@@ -744,22 +754,34 @@ impl LogicalPlan {
                     }
                     LogicalPlan::Join(Join {
                         on: ref keys,
+                        filter,
                         join_constraint,
                         join_type,
                         ..
                     }) => {
                         let join_expr: Vec<String> =
                             keys.iter().map(|(l, r)| format!("{} = {}", l, r)).collect();
+                        let filter_expr = filter
+                            .as_ref()
+                            .map(|expr| format!(" Filter: {}", expr))
+                            .unwrap_or_else(|| "".to_string());
                         match join_constraint {
                             JoinConstraint::On => {
-                                write!(f, "{} Join: {}", join_type, join_expr.join(", "))
+                                write!(
+                                    f,
+                                    "{} Join: {}{}",
+                                    join_type,
+                                    join_expr.join(", "),
+                                    filter_expr
+                                )
                             }
                             JoinConstraint::Using => {
                                 write!(
                                     f,
-                                    "{} Join: Using {}",
+                                    "{} Join: Using {}{}",
                                     join_type,
-                                    join_expr.join(", ")
+                                    join_expr.join(", "),
+                                    filter_expr,
                                 )
                             }
                         }
@@ -787,9 +809,17 @@ impl LogicalPlan {
                             )
                         }
                     },
-                    LogicalPlan::Limit(Limit { ref n, .. }) => write!(f, "Limit: {}", n),
-                    LogicalPlan::Offset(Offset { ref offset, .. }) => {
-                        write!(f, "Offset: {}", offset)
+                    LogicalPlan::Limit(Limit {
+                        ref skip,
+                        ref fetch,
+                        ..
+                    }) => {
+                        write!(
+                            f,
+                            "Limit: skip={}, fetch={}",
+                            skip.map_or("None".to_string(), |x| x.to_string()),
+                            fetch.map_or_else(|| "None".to_string(), |x| x.to_string())
+                        )
                     }
                     LogicalPlan::Subquery(Subquery { subquery, .. }) => {
                         write!(f, "Subquery: {:?}", subquery)
@@ -1008,8 +1038,8 @@ pub struct TableScan {
     pub projected_schema: DFSchemaRef,
     /// Optional expressions to be used as filters by the table provider
     pub filters: Vec<Expr>,
-    /// Optional limit to skip reading
-    pub limit: Option<usize>,
+    /// Optional number of rows to read
+    pub fetch: Option<usize>,
 }
 
 /// Apply Cross Join to two logical plans
@@ -1052,6 +1082,8 @@ pub struct CreateMemoryTable {
     pub input: Arc<LogicalPlan>,
     /// Option to not error if table already exists
     pub if_not_exists: bool,
+    /// Option to replace table content if table already exists
+    pub or_replace: bool,
 }
 
 /// Creates a view.
@@ -1066,7 +1098,7 @@ pub struct CreateView {
 }
 
 /// Types of files to parse as DataFrames
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     /// Newline-delimited JSON
     NdJson,
@@ -1135,8 +1167,10 @@ pub struct Extension {
 /// Produces the first `n` tuples from its input and discards the rest.
 #[derive(Clone)]
 pub struct Limit {
-    /// The limit
-    pub n: usize,
+    /// Number of rows to skip before fetch
+    pub skip: Option<usize>,
+    /// Maximum number of rows to fetch
+    pub fetch: Option<usize>,
     /// The logical plan
     pub input: Arc<LogicalPlan>,
 }
@@ -1182,6 +1216,8 @@ pub struct Join {
     pub right: Arc<LogicalPlan>,
     /// Equijoin clause expressed as pairs of (left, right) join columns
     pub on: Vec<(Column, Column)>,
+    /// Filters applied during join (non-equi conditions)
+    pub filter: Option<Expr>,
     /// Join type
     pub join_type: JoinType,
     /// Join constraint
@@ -1237,7 +1273,7 @@ pub enum Partitioning {
 
 /// Represents which type of plan, when storing multiple
 /// for use in EXPLAIN plans
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanType {
     /// The initial LogicalPlan provided to DataFusion
     InitialLogicalPlan,
@@ -1277,7 +1313,7 @@ impl fmt::Display for PlanType {
 }
 
 /// Represents some sort of execution plan, in String form
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::rc_buffer)]
 pub struct StringifiedPlan {
     /// An identifier of what type of plan this string represents
@@ -1310,4 +1346,338 @@ impl StringifiedPlan {
 pub trait ToStringifiedPlan {
     /// Create a stringified plan with the specified type
     fn to_stringified(&self, plan_type: PlanType) -> StringifiedPlan;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logical_plan::table_scan;
+    use crate::{col, lit};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn employee_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("first_name", DataType::Utf8, false),
+            Field::new("last_name", DataType::Utf8, false),
+            Field::new("state", DataType::Utf8, false),
+            Field::new("salary", DataType::Int32, false),
+        ])
+    }
+
+    fn display_plan() -> LogicalPlan {
+        table_scan(Some("employee_csv"), &employee_schema(), Some(vec![0, 3]))
+            .unwrap()
+            .filter(col("state").eq(lit("CO")))
+            .unwrap()
+            .project(vec![col("id")])
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_display_indent() {
+        let plan = display_plan();
+
+        let expected = "Projection: #employee_csv.id\
+        \n  Filter: #employee_csv.state = Utf8(\"CO\")\
+        \n    TableScan: employee_csv projection=Some([id, state])";
+
+        assert_eq!(expected, format!("{}", plan.display_indent()));
+    }
+
+    #[test]
+    fn test_display_indent_schema() {
+        let plan = display_plan();
+
+        let expected = "Projection: #employee_csv.id [id:Int32]\
+                        \n  Filter: #employee_csv.state = Utf8(\"CO\") [id:Int32, state:Utf8]\
+                        \n    TableScan: employee_csv projection=Some([id, state]) [id:Int32, state:Utf8]";
+
+        assert_eq!(expected, format!("{}", plan.display_indent_schema()));
+    }
+
+    #[test]
+    fn test_display_graphviz() {
+        let plan = display_plan();
+
+        // just test for a few key lines in the output rather than the
+        // whole thing to make test mainteance easier.
+        let graphviz = format!("{}", plan.display_graphviz());
+
+        assert!(
+            graphviz.contains(
+                r#"// Begin DataFusion GraphViz Plan (see https://graphviz.org)"#
+            ),
+            "\n{}",
+            plan.display_graphviz()
+        );
+        assert!(
+            graphviz.contains(
+                r#"[shape=box label="TableScan: employee_csv projection=Some([id, state])"]"#
+            ),
+            "\n{}",
+            plan.display_graphviz()
+        );
+        assert!(graphviz.contains(r#"[shape=box label="TableScan: employee_csv projection=Some([id, state])\nSchema: [id:Int32, state:Utf8]"]"#),
+                "\n{}", plan.display_graphviz());
+        assert!(
+            graphviz.contains(r#"// End DataFusion GraphViz Plan"#),
+            "\n{}",
+            plan.display_graphviz()
+        );
+    }
+
+    /// Tests for the Visitor trait and walking logical plan nodes
+    #[derive(Debug, Default)]
+    struct OkVisitor {
+        strings: Vec<String>,
+    }
+
+    impl PlanVisitor for OkVisitor {
+        type Error = String;
+
+        fn pre_visit(
+            &mut self,
+            plan: &LogicalPlan,
+        ) -> std::result::Result<bool, Self::Error> {
+            let s = match plan {
+                LogicalPlan::Projection { .. } => "pre_visit Projection",
+                LogicalPlan::Filter { .. } => "pre_visit Filter",
+                LogicalPlan::TableScan { .. } => "pre_visit TableScan",
+                _ => unimplemented!("unknown plan type"),
+            };
+
+            self.strings.push(s.into());
+            Ok(true)
+        }
+
+        fn post_visit(
+            &mut self,
+            plan: &LogicalPlan,
+        ) -> std::result::Result<bool, Self::Error> {
+            let s = match plan {
+                LogicalPlan::Projection { .. } => "post_visit Projection",
+                LogicalPlan::Filter { .. } => "post_visit Filter",
+                LogicalPlan::TableScan { .. } => "post_visit TableScan",
+                _ => unimplemented!("unknown plan type"),
+            };
+
+            self.strings.push(s.into());
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn visit_order() {
+        let mut visitor = OkVisitor::default();
+        let plan = test_plan();
+        let res = plan.accept(&mut visitor);
+        assert!(res.is_ok());
+
+        assert_eq!(
+            visitor.strings,
+            vec![
+                "pre_visit Projection",
+                "pre_visit Filter",
+                "pre_visit TableScan",
+                "post_visit TableScan",
+                "post_visit Filter",
+                "post_visit Projection",
+            ]
+        );
+    }
+
+    #[derive(Debug, Default)]
+    /// Counter than counts to zero and returns true when it gets there
+    struct OptionalCounter {
+        val: Option<usize>,
+    }
+
+    impl OptionalCounter {
+        fn new(val: usize) -> Self {
+            Self { val: Some(val) }
+        }
+        // Decrements the counter by 1, if any, returning true if it hits zero
+        fn dec(&mut self) -> bool {
+            if Some(0) == self.val {
+                true
+            } else {
+                self.val = self.val.take().map(|i| i - 1);
+                false
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    /// Visitor that returns false after some number of visits
+    struct StoppingVisitor {
+        inner: OkVisitor,
+        /// When Some(0) returns false from pre_visit
+        return_false_from_pre_in: OptionalCounter,
+        /// When Some(0) returns false from post_visit
+        return_false_from_post_in: OptionalCounter,
+    }
+
+    impl PlanVisitor for StoppingVisitor {
+        type Error = String;
+
+        fn pre_visit(
+            &mut self,
+            plan: &LogicalPlan,
+        ) -> std::result::Result<bool, Self::Error> {
+            if self.return_false_from_pre_in.dec() {
+                return Ok(false);
+            }
+            self.inner.pre_visit(plan)
+        }
+
+        fn post_visit(
+            &mut self,
+            plan: &LogicalPlan,
+        ) -> std::result::Result<bool, Self::Error> {
+            if self.return_false_from_post_in.dec() {
+                return Ok(false);
+            }
+
+            self.inner.post_visit(plan)
+        }
+    }
+
+    /// test early stopping in pre-visit
+    #[test]
+    fn early_stopping_pre_visit() {
+        let mut visitor = StoppingVisitor {
+            return_false_from_pre_in: OptionalCounter::new(2),
+            ..Default::default()
+        };
+        let plan = test_plan();
+        let res = plan.accept(&mut visitor);
+        assert!(res.is_ok());
+
+        assert_eq!(
+            visitor.inner.strings,
+            vec!["pre_visit Projection", "pre_visit Filter"]
+        );
+    }
+
+    #[test]
+    fn early_stopping_post_visit() {
+        let mut visitor = StoppingVisitor {
+            return_false_from_post_in: OptionalCounter::new(1),
+            ..Default::default()
+        };
+        let plan = test_plan();
+        let res = plan.accept(&mut visitor);
+        assert!(res.is_ok());
+
+        assert_eq!(
+            visitor.inner.strings,
+            vec![
+                "pre_visit Projection",
+                "pre_visit Filter",
+                "pre_visit TableScan",
+                "post_visit TableScan",
+            ]
+        );
+    }
+
+    #[derive(Debug, Default)]
+    /// Visitor that returns an error after some number of visits
+    struct ErrorVisitor {
+        inner: OkVisitor,
+        /// When Some(0) returns false from pre_visit
+        return_error_from_pre_in: OptionalCounter,
+        /// When Some(0) returns false from post_visit
+        return_error_from_post_in: OptionalCounter,
+    }
+
+    impl PlanVisitor for ErrorVisitor {
+        type Error = String;
+
+        fn pre_visit(
+            &mut self,
+            plan: &LogicalPlan,
+        ) -> std::result::Result<bool, Self::Error> {
+            if self.return_error_from_pre_in.dec() {
+                return Err("Error in pre_visit".into());
+            }
+
+            self.inner.pre_visit(plan)
+        }
+
+        fn post_visit(
+            &mut self,
+            plan: &LogicalPlan,
+        ) -> std::result::Result<bool, Self::Error> {
+            if self.return_error_from_post_in.dec() {
+                return Err("Error in post_visit".into());
+            }
+
+            self.inner.post_visit(plan)
+        }
+    }
+
+    #[test]
+    fn error_pre_visit() {
+        let mut visitor = ErrorVisitor {
+            return_error_from_pre_in: OptionalCounter::new(2),
+            ..Default::default()
+        };
+        let plan = test_plan();
+        let res = plan.accept(&mut visitor);
+
+        if let Err(e) = res {
+            assert_eq!("Error in pre_visit", e);
+        } else {
+            panic!("Expected an error");
+        }
+
+        assert_eq!(
+            visitor.inner.strings,
+            vec!["pre_visit Projection", "pre_visit Filter"]
+        );
+    }
+
+    #[test]
+    fn error_post_visit() {
+        let mut visitor = ErrorVisitor {
+            return_error_from_post_in: OptionalCounter::new(1),
+            ..Default::default()
+        };
+        let plan = test_plan();
+        let res = plan.accept(&mut visitor);
+        if let Err(e) = res {
+            assert_eq!("Error in post_visit", e);
+        } else {
+            panic!("Expected an error");
+        }
+
+        assert_eq!(
+            visitor.inner.strings,
+            vec![
+                "pre_visit Projection",
+                "pre_visit Filter",
+                "pre_visit TableScan",
+                "post_visit TableScan",
+            ]
+        );
+    }
+
+    fn test_plan() -> LogicalPlan {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("state", DataType::Utf8, false),
+        ]);
+
+        table_scan(None, &schema, Some(vec![0, 1]))
+            .unwrap()
+            .filter(col("state").eq(lit("CO")))
+            .unwrap()
+            .project(vec![col("id")])
+            .unwrap()
+            .build()
+            .unwrap()
+    }
 }

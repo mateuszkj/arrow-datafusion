@@ -91,7 +91,7 @@ pub use self::planner::PhysicalPlanner;
 /// Fields are optional and can be inexact because the sources
 /// sometimes provide approximate estimates for performance reasons
 /// and the transformations output are not always predictable.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Statistics {
     /// The number of table rows
     pub num_rows: Option<usize>,
@@ -105,7 +105,7 @@ pub struct Statistics {
     pub is_exact: bool,
 }
 /// This table statistics are estimates about column
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ColumnStatistics {
     /// Number of null values on column
     pub null_count: Option<usize>,
@@ -288,6 +288,7 @@ pub fn with_new_children_if_necessary(
 /// ```
 /// use datafusion::prelude::*;
 /// use datafusion::physical_plan::displayable;
+/// use std::path::is_separator;
 ///
 /// #[tokio::main]
 /// async fn main() {
@@ -310,11 +311,15 @@ pub fn with_new_children_if_necessary(
 ///   let displayable_plan = displayable(physical_plan.as_ref());
 ///   let plan_string = format!("{}", displayable_plan.indent());
 ///
+///   let working_directory = std::env::current_dir().unwrap();
+///   let normalized = working_directory.to_string_lossy().replace(is_separator, "/");
+///   let plan_string = plan_string.replace(&normalized, "WORKING_DIR");
+///
 ///   assert_eq!("ProjectionExec: expr=[a@0 as a]\
 ///              \n  CoalesceBatchesExec: target_batch_size=4096\
 ///              \n    FilterExec: a@0 < 5\
 ///              \n      RepartitionExec: partitioning=RoundRobinBatch(3)\
-///              \n        CsvExec: files=[tests/example.csv], has_header=true, limit=None, projection=[a]",
+///              \n        CsvExec: files=[WORKING_DIR/tests/example.csv], has_header=true, limit=None, projection=[a]",
 ///               plan_string.trim());
 ///
 ///   let one_line = format!("{}", displayable_plan.one_line());
@@ -547,12 +552,8 @@ pub mod cross_join;
 pub mod display;
 pub mod empty;
 pub mod explain;
-use crate::execution::context::TaskContext;
-pub use datafusion_physical_expr::expressions;
-
 pub mod file_format;
 pub mod filter;
-pub mod functions;
 pub mod hash_join;
 pub mod hash_utils;
 pub mod join_utils;
@@ -565,9 +566,10 @@ pub mod repartition;
 pub mod sort_merge_join;
 pub mod sorts;
 pub mod stream;
-pub mod type_coercion;
 pub mod udaf;
-pub mod udf;
 pub mod union;
 pub mod values;
 pub mod windows;
+
+use crate::execution::context::TaskContext;
+pub use datafusion_physical_expr::{expressions, functions, type_coercion, udf};
