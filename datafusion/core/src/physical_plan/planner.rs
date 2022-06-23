@@ -259,7 +259,7 @@ fn create_physical_name(e: &Expr, is_first_expr: bool) -> Result<String> {
 /// Physical query planner that converts a `LogicalPlan` to an
 /// `ExecutionPlan` suitable for execution.
 #[async_trait]
-pub trait PhysicalPlanner {
+pub trait PhysicalPlanner: Send + Sync {
     /// Create a physical plan from a logical plan
     async fn create_physical_plan(
         &self,
@@ -285,6 +285,7 @@ pub trait PhysicalPlanner {
 }
 
 /// This trait exposes the ability to plan an [`ExecutionPlan`] out of a [`LogicalPlan`].
+#[async_trait]
 pub trait ExtensionPlanner {
     /// Create a physical plan for a [`UserDefinedLogicalNode`].
     ///
@@ -296,7 +297,7 @@ pub trait ExtensionPlanner {
     /// Returns `None` when the planner does not know how to plan the
     /// `node` and wants to delegate the planning to another
     /// [`ExtensionPlanner`].
-    fn plan_extension(
+    async fn plan_extension(
         &self,
         planner: &dyn PhysicalPlanner,
         node: &dyn UserDefinedLogicalNode,
@@ -964,22 +965,27 @@ impl DefaultPhysicalPlanner {
                         .try_collect::<Vec<_>>()
                         .await?;
 
-                    let maybe_plan = self.extension_planners.iter().try_fold(
-                        None,
-                        |maybe_plan, planner| {
-                            if let Some(plan) = maybe_plan {
-                                Ok(Some(plan))
-                            } else {
-                                planner.plan_extension(
-                                    self,
-                                    e.node.as_ref(),
-                                    &e.node.inputs(),
-                                    &physical_inputs,
-                                    session_state,
-                                )
-                            }
-                        },
-                    )?;
+                    let mut maybe_plan = None;
+                    for planner in &self.extension_planners {
+                        if maybe_plan.is_some() {
+                            break;
+                        }
+
+                        let logical_input = e.node.inputs();
+                        let plan = planner.plan_extension(
+                            self,
+                            e.node.as_ref(),
+                            &logical_input,
+                            &physical_inputs,
+                            session_state,
+                        );
+                        let plan = plan.await;
+                        if plan.is_err() {
+                            continue;
+                        }
+                        maybe_plan = plan.unwrap();
+                    }
+
                     let plan = maybe_plan.ok_or_else(|| DataFusionError::Plan(format!(
                         "No installed planner was able to convert the custom node to an execution plan: {:?}", e.node
                     )))?;
@@ -1543,6 +1549,7 @@ fn tuple_err<T, R>(value: (Result<T>, Result<R>)) -> Result<(T, R)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assert_contains;
     use crate::execution::context::TaskContext;
     use crate::execution::options::CsvReadOptions;
     use crate::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
@@ -1826,10 +1833,7 @@ mod tests {
     #[tokio::test]
     async fn in_list_types() -> Result<()> {
         // expression: "a in ('a', 1)"
-        let list = vec![
-            Expr::Literal(ScalarValue::Utf8(Some("a".to_string()))),
-            Expr::Literal(ScalarValue::Int64(Some(1))),
-        ];
+        let list = vec![lit("a"), lit(1i64)];
         let logical_plan = test_csv_scan()
             .await?
             // filter clause needs the type coercion rule applied
@@ -1841,11 +1845,9 @@ mod tests {
         let expected = "InListExpr { expr: Column { name: \"c1\", index: 0 }, list: [Literal { value: Utf8(\"a\") }, CastExpr { expr: Literal { value: Int64(1) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }], negated: false, set: None }";
         assert!(format!("{:?}", execution_plan).contains(expected));
 
-        // expression: "a in (true, 'a')"
-        let list = vec![
-            Expr::Literal(ScalarValue::Boolean(Some(true))),
-            Expr::Literal(ScalarValue::Utf8(Some("a".to_string()))),
-        ];
+        // expression: "a in (struct::null, 'a')"
+        let list = vec![struct_literal(), lit("a")];
+
         let logical_plan = test_csv_scan()
             .await?
             // filter clause needs the type coercion rule applied
@@ -1854,18 +1856,20 @@ mod tests {
             .build()?;
         let execution_plan = plan(&logical_plan).await;
 
-        let expected_error = "Unsupported CAST from Utf8 to Boolean";
-        match execution_plan {
-            Ok(_) => panic!("Expected planning failure"),
-            Err(e) => assert!(
-                e.to_string().contains(expected_error),
-                "Error '{}' did not contain expected error '{}'",
-                e,
-                expected_error
-            ),
-        }
+        let e = execution_plan.unwrap_err().to_string();
+        assert_contains!(&e, "Unsupported CAST from Struct");
+        assert_contains!(&e, "to Boolean");
 
         Ok(())
+    }
+
+    /// Return a `null` literal representing a struct type like: `{ a: bool }`
+    fn struct_literal() -> Expr {
+        let struct_literal = ScalarValue::Struct(
+            None,
+            Box::new(vec![Field::new("foo", DataType::Boolean, false)]),
+        );
+        lit(struct_literal)
     }
 
     #[tokio::test]
@@ -2082,7 +2086,7 @@ mod tests {
             &self,
             _exprs: &[Expr],
             _inputs: &[LogicalPlan],
-        ) -> Arc<dyn UserDefinedLogicalNode + Send + Sync> {
+        ) -> Arc<dyn UserDefinedLogicalNode> {
             unimplemented!("NoOp");
         }
     }
@@ -2154,9 +2158,10 @@ mod tests {
     //  the logical plan node.
     struct BadExtensionPlanner {}
 
+    #[async_trait]
     impl ExtensionPlanner for BadExtensionPlanner {
         /// Create a physical plan for an extension node
-        fn plan_extension(
+        async fn plan_extension(
             &self,
             _planner: &dyn PhysicalPlanner,
             _node: &dyn UserDefinedLogicalNode,

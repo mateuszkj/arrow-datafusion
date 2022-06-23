@@ -1161,7 +1161,7 @@ pub struct Analyze {
 #[derive(Clone)]
 pub struct Extension {
     /// The runtime extension operator
-    pub node: Arc<dyn UserDefinedLogicalNode + Send + Sync>,
+    pub node: Arc<dyn UserDefinedLogicalNode>,
 }
 
 /// Produces the first `n` tuples from its input and discards the rest.
@@ -1171,15 +1171,6 @@ pub struct Limit {
     pub skip: Option<usize>,
     /// Maximum number of rows to fetch
     pub fetch: Option<usize>,
-    /// The logical plan
-    pub input: Arc<LogicalPlan>,
-}
-
-/// Adjusts the starting point at which the rest of the expressions begin to effect
-#[derive(Clone)]
-pub struct Offset {
-    /// The offset
-    pub offset: usize,
     /// The logical plan
     pub input: Arc<LogicalPlan>,
 }
