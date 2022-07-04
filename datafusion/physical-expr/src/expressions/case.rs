@@ -25,6 +25,7 @@ use arrow::compute::{and, eq_dyn, is_null, not, or, or_kleene};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result};
+use datafusion_expr::binary_rule::comparison_eq_coercion;
 use datafusion_expr::ColumnarValue;
 
 type WhenThen = (Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>);
@@ -76,7 +77,7 @@ impl CaseExpr {
     /// Create a new CASE WHEN expression
     pub fn try_new(
         expr: Option<Arc<dyn PhysicalExpr>>,
-        when_then_expr: &[WhenThen],
+        when_then_expr: Vec<WhenThen>,
         else_expr: Option<Arc<dyn PhysicalExpr>>,
     ) -> Result<Self> {
         if when_then_expr.is_empty() {
@@ -86,7 +87,7 @@ impl CaseExpr {
         } else {
             Ok(Self {
                 expr,
-                when_then_expr: when_then_expr.to_vec(),
+                when_then_expr,
                 else_expr,
             })
         }
@@ -269,7 +270,9 @@ impl PhysicalExpr for CaseExpr {
         } else if let Some(e) = &self.else_expr {
             e.nullable(input_schema)
         } else {
-            Ok(false)
+            // CASE produces NULL if there is no `else` expr
+            // (aka when none of the `when_then_exprs` match)
+            Ok(true)
         }
     }
 
@@ -289,10 +292,66 @@ impl PhysicalExpr for CaseExpr {
 /// Create a CASE expression
 pub fn case(
     expr: Option<Arc<dyn PhysicalExpr>>,
+    when_thens: Vec<WhenThen>,
+    else_expr: Option<Arc<dyn PhysicalExpr>>,
+    input_schema: &Schema,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    // all the result of then and else should be convert to a common data type,
+    // if they can be coercible to a common data type, return error.
+    let coerce_type = get_case_common_type(&when_thens, else_expr.clone(), input_schema);
+    let (when_thens, else_expr) = match coerce_type {
+        None => Err(DataFusionError::Plan(format!(
+            "Can't get a common type for then {:?} and else {:?} expression",
+            when_thens, else_expr
+        ))),
+        Some(data_type) => {
+            // cast then expr
+            let left = when_thens
+                .into_iter()
+                .map(|(when, then)| {
+                    let then = try_cast(then, input_schema, data_type.clone())?;
+                    Ok((when, then))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let right = match else_expr {
+                None => None,
+                Some(expr) => Some(try_cast(expr, input_schema, data_type.clone())?),
+            };
+
+            Ok((left, right))
+        }
+    }?;
+
+    Ok(Arc::new(CaseExpr::try_new(expr, when_thens, else_expr)?))
+}
+
+fn get_case_common_type(
     when_thens: &[WhenThen],
     else_expr: Option<Arc<dyn PhysicalExpr>>,
-) -> Result<Arc<dyn PhysicalExpr>> {
-    Ok(Arc::new(CaseExpr::try_new(expr, when_thens, else_expr)?))
+    input_schema: &Schema,
+) -> Option<DataType> {
+    let thens_type = when_thens
+        .iter()
+        .map(|when_then| {
+            let data_type = &when_then.1.data_type(input_schema).unwrap();
+            data_type.clone()
+        })
+        .collect::<Vec<_>>();
+    let else_type = match else_expr {
+        None => {
+            // case when then exprs must have one then value
+            thens_type[0].clone()
+        }
+        Some(else_phy_expr) => else_phy_expr.data_type(input_schema).unwrap(),
+    };
+    thens_type
+        .iter()
+        .fold(Some(else_type), |left, right_type| match left {
+            None => None,
+            // TODO: now just use the `equal` coercion rule for case when. If find the issue, and
+            // refactor again.
+            Some(left_type) => comparison_eq_coercion(&left_type, right_type),
+        })
 }
 
 #[cfg(test)]
@@ -314,15 +373,16 @@ mod tests {
         let schema = batch.schema();
 
         // CASE a WHEN 'foo' THEN 123 WHEN 'bar' THEN 456 END
-        let when1 = lit(ScalarValue::Utf8(Some("foo".to_string())));
-        let then1 = lit(ScalarValue::Int32(Some(123)));
-        let when2 = lit(ScalarValue::Utf8(Some("bar".to_string())));
-        let then2 = lit(ScalarValue::Int32(Some(456)));
+        let when1 = lit("foo");
+        let then1 = lit(123i32);
+        let when2 = lit("bar");
+        let then2 = lit(456i32);
 
         let expr = case(
             Some(col("a", &schema)?),
-            &[(when1, then1), (when2, then2)],
+            vec![(when1, then1), (when2, then2)],
             None,
+            schema.as_ref(),
         )?;
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows());
         let result = result
@@ -343,16 +403,17 @@ mod tests {
         let schema = batch.schema();
 
         // CASE a WHEN 'foo' THEN 123 WHEN 'bar' THEN 456 ELSE 999 END
-        let when1 = lit(ScalarValue::Utf8(Some("foo".to_string())));
-        let then1 = lit(ScalarValue::Int32(Some(123)));
-        let when2 = lit(ScalarValue::Utf8(Some("bar".to_string())));
-        let then2 = lit(ScalarValue::Int32(Some(456)));
-        let else_value = lit(ScalarValue::Int32(Some(999)));
+        let when1 = lit("foo");
+        let then1 = lit(123i32);
+        let when2 = lit("bar");
+        let then2 = lit(456i32);
+        let else_value = lit(999i32);
 
         let expr = case(
             Some(col("a", &schema)?),
-            &[(when1, then1), (when2, then2)],
+            vec![(when1, then1), (when2, then2)],
             Some(else_value),
+            schema.as_ref(),
         )?;
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows());
         let result = result
@@ -374,10 +435,10 @@ mod tests {
         let schema = batch.schema();
 
         // CASE a when 0 THEN float64(null) ELSE 25.0 / cast(a, float64)  END
-        let when1 = lit(ScalarValue::Int32(Some(0)));
+        let when1 = lit(0i32);
         let then1 = lit(ScalarValue::Float64(None));
         let else_value = binary(
-            lit(ScalarValue::Float64(Some(25.0))),
+            lit(25.0f64),
             Operator::Divide,
             cast(col("a", &schema)?, &batch.schema(), Float64)?,
             &batch.schema(),
@@ -385,8 +446,9 @@ mod tests {
 
         let expr = case(
             Some(col("a", &schema)?),
-            &[(when1, then1)],
+            vec![(when1, then1)],
             Some(else_value),
+            schema.as_ref(),
         )?;
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows());
         let result = result
@@ -410,19 +472,24 @@ mod tests {
         let when1 = binary(
             col("a", &schema)?,
             Operator::Eq,
-            lit(ScalarValue::Utf8(Some("foo".to_string()))),
+            lit("foo"),
             &batch.schema(),
         )?;
-        let then1 = lit(ScalarValue::Int32(Some(123)));
+        let then1 = lit(123i32);
         let when2 = binary(
             col("a", &schema)?,
             Operator::Eq,
-            lit(ScalarValue::Utf8(Some("bar".to_string()))),
+            lit("bar"),
             &batch.schema(),
         )?;
-        let then2 = lit(ScalarValue::Int32(Some(456)));
+        let then2 = lit(456i32);
 
-        let expr = case(None, &[(when1, then1), (when2, then2)], None)?;
+        let expr = case(
+            None,
+            vec![(when1, then1), (when2, then2)],
+            None,
+            schema.as_ref(),
+        )?;
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows());
         let result = result
             .as_any()
@@ -442,21 +509,16 @@ mod tests {
         let schema = batch.schema();
 
         // CASE WHEN a > 0 THEN 25.0 / cast(a, float64) ELSE float64(null) END
-        let when1 = binary(
-            col("a", &schema)?,
-            Operator::Gt,
-            lit(ScalarValue::Int32(Some(0))),
-            &batch.schema(),
-        )?;
+        let when1 = binary(col("a", &schema)?, Operator::Gt, lit(0i32), &batch.schema())?;
         let then1 = binary(
-            lit(ScalarValue::Float64(Some(25.0))),
+            lit(25.0f64),
             Operator::Divide,
             cast(col("a", &schema)?, &batch.schema(), Float64)?,
             &batch.schema(),
         )?;
         let x = lit(ScalarValue::Float64(None));
 
-        let expr = case(None, &[(when1, then1)], Some(x))?;
+        let expr = case(None, vec![(when1, then1)], Some(x), schema.as_ref())?;
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows());
         let result = result
             .as_any()
@@ -486,20 +548,25 @@ mod tests {
         let when1 = binary(
             col("a", &schema)?,
             Operator::Eq,
-            lit(ScalarValue::Utf8(Some("foo".to_string()))),
+            lit("foo"),
             &batch.schema(),
         )?;
-        let then1 = lit(ScalarValue::Int32(Some(123)));
+        let then1 = lit(123i32);
         let when2 = binary(
             col("a", &schema)?,
             Operator::Eq,
-            lit(ScalarValue::Utf8(Some("bar".to_string()))),
+            lit("bar"),
             &batch.schema(),
         )?;
-        let then2 = lit(ScalarValue::Int32(Some(456)));
-        let else_value = lit(ScalarValue::Int32(Some(999)));
+        let then2 = lit(456i32);
+        let else_value = lit(999i32);
 
-        let expr = case(None, &[(when1, then1), (when2, then2)], Some(else_value))?;
+        let expr = case(
+            None,
+            vec![(when1, then1), (when2, then2)],
+            Some(else_value),
+            schema.as_ref(),
+        )?;
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows());
         let result = result
             .as_any()
@@ -523,13 +590,13 @@ mod tests {
         let when = binary(
             col("a", &schema)?,
             Operator::Eq,
-            lit(ScalarValue::Utf8(Some("foo".to_string()))),
+            lit("foo"),
             &batch.schema(),
         )?;
-        let then = lit(ScalarValue::Float64(Some(123.3)));
-        let else_value = lit(ScalarValue::Int32(Some(999)));
+        let then = lit(123.3f64);
+        let else_value = lit(999i32);
 
-        let expr = case(None, &[(when, then)], Some(else_value))?;
+        let expr = case(None, vec![(when, then)], Some(else_value), schema.as_ref())?;
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows());
         let result = result
             .as_any()
@@ -553,12 +620,12 @@ mod tests {
         let when = binary(
             col("load4", &schema)?,
             Operator::Eq,
-            lit(ScalarValue::Float64(Some(1.77))),
+            lit(1.77f64),
             &batch.schema(),
         )?;
         let then = col("load4", &schema)?;
 
-        let expr = case(None, &[(when, then)], None)?;
+        let expr = case(None, vec![(when, then)], None, schema.as_ref())?;
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows());
         let result = result
             .as_any()
@@ -580,10 +647,10 @@ mod tests {
 
         // SELECT CASE load4 WHEN 1.77 THEN load4 END
         let expr = col("load4", &schema)?;
-        let when = lit(ScalarValue::Float64(Some(1.77)));
+        let when = lit(1.77f64);
         let then = col("load4", &schema)?;
 
-        let expr = case(Some(expr), &[(when, then)], None)?;
+        let expr = case(Some(expr), vec![(when, then)], None, schema.as_ref())?;
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows());
         let result = result
             .as_any()
@@ -632,5 +699,68 @@ mod tests {
         let batch =
             RecordBatch::try_from_iter(vec![("load4", Arc::new(load4) as ArrayRef)])?;
         Ok(batch)
+    }
+
+    #[test]
+    fn case_test_incompatible() -> Result<()> {
+        // 1 then is int64
+        // 2 then is boolean
+        let batch = case_test_batch()?;
+        let schema = batch.schema();
+
+        // CASE WHEN a = 'foo' THEN 123 WHEN a = 'bar' THEN true END
+        let when1 = binary(
+            col("a", &schema)?,
+            Operator::Eq,
+            lit("foo"),
+            &batch.schema(),
+        )?;
+        let then1 = lit(123i32);
+        let when2 = binary(
+            col("a", &schema)?,
+            Operator::Eq,
+            lit("bar"),
+            &batch.schema(),
+        )?;
+        let then2 = lit(true);
+
+        let expr = case(
+            None,
+            vec![(when1, then1), (when2, then2)],
+            None,
+            schema.as_ref(),
+        );
+        assert!(expr.is_err());
+
+        // then 1 is int32
+        // then 2 is int64
+        // else is float
+        // CASE WHEN a = 'foo' THEN 123 WHEN a = 'bar' THEN 456 ELSE 1.23 END
+        let when1 = binary(
+            col("a", &schema)?,
+            Operator::Eq,
+            lit("foo"),
+            &batch.schema(),
+        )?;
+        let then1 = lit(123i32);
+        let when2 = binary(
+            col("a", &schema)?,
+            Operator::Eq,
+            lit("bar"),
+            &batch.schema(),
+        )?;
+        let then2 = lit(456i64);
+        let else_expr = lit(1.23f64);
+
+        let expr = case(
+            None,
+            vec![(when1, then1), (when2, then2)],
+            Some(else_expr),
+            schema.as_ref(),
+        );
+        assert!(expr.is_ok());
+        let result_type = expr.unwrap().data_type(schema.as_ref())?;
+        assert_eq!(DataType::Float64, result_type);
+        Ok(())
     }
 }
