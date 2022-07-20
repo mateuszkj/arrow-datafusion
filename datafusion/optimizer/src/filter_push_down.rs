@@ -616,7 +616,11 @@ impl OptimizerRule for FilterPushDown {
         "filter_push_down"
     }
 
-    fn optimize(&self, plan: &LogicalPlan, _: &OptimizerConfig) -> Result<LogicalPlan> {
+    fn optimize(
+        &self,
+        plan: &LogicalPlan,
+        _: &mut OptimizerConfig,
+    ) -> Result<LogicalPlan> {
         optimize(plan, State::default())
     }
 }
@@ -666,7 +670,7 @@ mod tests {
 
     fn optimize_plan(plan: &LogicalPlan) -> LogicalPlan {
         let rule = FilterPushDown::new();
-        rule.optimize(plan, &OptimizerConfig::new())
+        rule.optimize(plan, &mut OptimizerConfig::new())
             .expect("failed to optimize plan")
     }
 
@@ -2068,7 +2072,10 @@ mod tests {
 
         // filter on col b in subquery
         let expected_before = "\
-        Filter: #b IN (Subquery: Projection: #sq.c\n  TableScan: sq)\
+        Filter: #b IN (<subquery>)\
+        \n  Subquery:\
+        \n    Projection: #sq.c\
+        \n      TableScan: sq\
         \n  Projection: #test.a AS b, #test.c\
         \n    TableScan: test";
         assert_eq!(format!("{:?}", plan), expected_before);
@@ -2076,7 +2083,10 @@ mod tests {
         // rewrite filter col b to test.a
         let expected_after = "\
         Projection: #test.a AS b, #test.c\
-        \n  Filter: #test.a IN (Subquery: Projection: #sq.c\n  TableScan: sq)\
+        \n  Filter: #test.a IN (<subquery>)\
+        \n    Subquery:\
+        \n      Projection: #sq.c\
+        \n        TableScan: sq\
         \n    TableScan: test";
         assert_optimized_plan_eq(&plan, expected_after);
 

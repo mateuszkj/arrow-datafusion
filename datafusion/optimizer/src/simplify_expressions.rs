@@ -193,7 +193,7 @@ impl OptimizerRule for SimplifyExpressions {
     fn optimize(
         &self,
         plan: &LogicalPlan,
-        optimizer_config: &OptimizerConfig,
+        optimizer_config: &mut OptimizerConfig,
     ) -> Result<LogicalPlan> {
         let mut execution_props = ExecutionProps::new();
         execution_props.query_execution_start_time =
@@ -1545,7 +1545,7 @@ mod tests {
     fn assert_optimized_plan_eq(plan: &LogicalPlan, expected: &str) {
         let rule = SimplifyExpressions::new();
         let optimized_plan = rule
-            .optimize(plan, &OptimizerConfig::new())
+            .optimize(plan, &mut OptimizerConfig::new())
             .expect("failed to optimize plan");
         let formatted_plan = format!("{:?}", optimized_plan);
         assert_eq!(formatted_plan, expected);
@@ -1768,7 +1768,7 @@ mod tests {
         let rule = SimplifyExpressions::new();
 
         let err = rule
-            .optimize(plan, &config)
+            .optimize(plan, &mut config)
             .expect_err("expected optimization to fail");
 
         err.to_string()
@@ -1783,7 +1783,7 @@ mod tests {
         let rule = SimplifyExpressions::new();
 
         let optimized_plan = rule
-            .optimize(plan, &config)
+            .optimize(plan, &mut config)
             .expect("failed to optimize plan");
         return format!("{:?}", optimized_plan);
     }
@@ -1946,7 +1946,7 @@ mod tests {
         let date_plus_interval_expr = to_timestamp_expr(ts_string)
             .cast_to(&DataType::Date32, schema)
             .unwrap()
-            + Expr::Literal(ScalarValue::IntervalDayTime(Some(123)));
+            + Expr::Literal(ScalarValue::IntervalDayTime(Some(123i64 << 32)));
 
         let plan = LogicalPlanBuilder::from(table_scan.clone())
             .project(vec![date_plus_interval_expr])
@@ -1958,10 +1958,10 @@ mod tests {
 
         // Note that constant folder runs and folds the entire
         // expression down to a single constant (true)
-        let expected = "Projection: Date32(\"18636\") AS CAST(totimestamp(Utf8(\"2020-09-08T12:05:00+00:00\")) AS Date32) + IntervalDayTime(\"123\")\
-            \n  TableScan: test";
+        let expected = r#"Projection: Date32("18636") AS CAST(totimestamp(Utf8("2020-09-08T12:05:00+00:00")) AS Date32) + IntervalDayTime("528280977408")
+  TableScan: test"#;
         let actual = get_optimized_plan_formatted(&plan, &time);
 
-        assert_eq!(expected, actual);
+        assert_eq!(actual, expected);
     }
 }

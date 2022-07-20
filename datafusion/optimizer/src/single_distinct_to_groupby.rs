@@ -141,12 +141,12 @@ fn optimize(plan: &LogicalPlan) -> Result<LogicalPlan> {
                     schema: final_agg_schema,
                 });
 
-                Ok(LogicalPlan::Projection(Projection {
-                    expr: alias_expr,
-                    input: Arc::new(final_agg),
-                    schema: schema.clone(),
-                    alias: None,
-                }))
+                Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
+                    alias_expr,
+                    Arc::new(final_agg),
+                    schema.clone(),
+                    None,
+                )?))
             } else {
                 optimize_children(plan)
             }
@@ -199,7 +199,7 @@ impl OptimizerRule for SingleDistinctToGroupBy {
     fn optimize(
         &self,
         plan: &LogicalPlan,
-        _optimizer_config: &OptimizerConfig,
+        _optimizer_config: &mut OptimizerConfig,
     ) -> Result<LogicalPlan> {
         optimize(plan)
     }
@@ -221,7 +221,7 @@ mod tests {
     fn assert_optimized_plan_eq(plan: &LogicalPlan, expected: &str) {
         let rule = SingleDistinctToGroupBy::new();
         let optimized_plan = rule
-            .optimize(plan, &OptimizerConfig::new())
+            .optimize(plan, &mut OptimizerConfig::new())
             .expect("failed to optimize plan");
 
         let formatted_plan = format!("{}", optimized_plan.display_indent_schema());

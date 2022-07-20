@@ -22,6 +22,7 @@ use super::{
     aggregates, empty::EmptyExec, hash_join::PartitionMode, udaf, union::UnionExec,
     values::ValuesExec, windows,
 };
+use crate::config::{OPT_EXPLAIN_LOGICAL_PLAN_ONLY, OPT_EXPLAIN_PHYSICAL_PLAN_ONLY};
 use crate::datasource::source_as_provider;
 use crate::execution::context::{ExecutionProps, SessionState};
 use crate::logical_expr::utils::generate_sort_key;
@@ -1487,26 +1488,42 @@ impl DefaultPhysicalPlanner {
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if let LogicalPlan::Explain(e) = logical_plan {
             use PlanType::*;
-            let mut stringified_plans = e.stringified_plans.clone();
+            let mut stringified_plans = vec![];
 
-            stringified_plans.push(e.plan.to_stringified(FinalLogicalPlan));
+            if !session_state
+                .config
+                .config_options
+                .get_bool(OPT_EXPLAIN_PHYSICAL_PLAN_ONLY)
+            {
+                stringified_plans = e.stringified_plans.clone();
 
-            let input = self
-                .create_initial_plan(e.plan.as_ref(), session_state)
-                .await?;
+                stringified_plans.push(e.plan.to_stringified(FinalLogicalPlan));
+            }
 
-            stringified_plans
-                .push(displayable(input.as_ref()).to_stringified(InitialPhysicalPlan));
+            if !session_state
+                .config
+                .config_options
+                .get_bool(OPT_EXPLAIN_LOGICAL_PLAN_ONLY)
+            {
+                let input = self
+                    .create_initial_plan(e.plan.as_ref(), session_state)
+                    .await?;
 
-            let input =
-                self.optimize_internal(input, session_state, |plan, optimizer| {
-                    let optimizer_name = optimizer.name().to_string();
-                    let plan_type = OptimizedPhysicalPlan { optimizer_name };
-                    stringified_plans.push(displayable(plan).to_stringified(plan_type));
-                })?;
+                stringified_plans.push(
+                    displayable(input.as_ref()).to_stringified(InitialPhysicalPlan),
+                );
 
-            stringified_plans
-                .push(displayable(input.as_ref()).to_stringified(FinalPhysicalPlan));
+                let input =
+                    self.optimize_internal(input, session_state, |plan, optimizer| {
+                        let optimizer_name = optimizer.name().to_string();
+                        let plan_type = OptimizedPhysicalPlan { optimizer_name };
+                        stringified_plans
+                            .push(displayable(plan).to_stringified(plan_type));
+                    })?;
+
+                stringified_plans
+                    .push(displayable(input.as_ref()).to_stringified(FinalPhysicalPlan));
+            }
 
             Ok(Some(Arc::new(ExplainExec::new(
                 SchemaRef::new(e.schema.as_ref().to_owned().into()),
@@ -1565,7 +1582,7 @@ mod tests {
     use crate::assert_contains;
     use crate::execution::context::TaskContext;
     use crate::execution::options::CsvReadOptions;
-    use crate::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+    use crate::execution::runtime_env::RuntimeEnv;
     use crate::logical_plan::plan::Extension;
     use crate::physical_plan::{
         expressions, DisplayFormatType, Partitioning, Statistics,
@@ -1587,7 +1604,7 @@ mod tests {
     use std::{any::Any, fmt};
 
     fn make_session_state() -> SessionState {
-        let runtime = Arc::new(RuntimeEnv::new(RuntimeConfig::default()).unwrap());
+        let runtime = Arc::new(RuntimeEnv::default());
         SessionState::with_config_rt(SessionConfig::new(), runtime)
     }
 
@@ -1746,8 +1763,6 @@ mod tests {
     async fn errors() -> Result<()> {
         let bool_expr = col("c1").eq(col("c1"));
         let cases = vec![
-            // utf8 < u32
-            col("c1").lt(col("c2")),
             // utf8 AND utf8
             col("c1").and(col("c1")),
             // u8 AND u8

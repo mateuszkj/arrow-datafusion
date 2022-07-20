@@ -44,8 +44,12 @@ use crate::{
 };
 pub use datafusion_physical_expr::execution_props::ExecutionProps;
 use parking_lot::RwLock;
-use std::string::String;
 use std::sync::Arc;
+use std::{
+    any::{Any, TypeId},
+    hash::{BuildHasherDefault, Hasher},
+    string::String,
+};
 use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
@@ -83,9 +87,9 @@ use crate::physical_optimizer::repartition::Repartition;
 
 use crate::config::{
     ConfigOptions, OPT_BATCH_SIZE, OPT_COALESCE_BATCHES, OPT_COALESCE_TARGET_BATCH_SIZE,
-    OPT_FILTER_NULL_JOIN_KEYS,
+    OPT_FILTER_NULL_JOIN_KEYS, OPT_OPTIMIZER_SKIP_FAILED_RULES,
 };
-use crate::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+use crate::execution::runtime_env::RuntimeEnv;
 use crate::logical_plan::plan::Explain;
 use crate::physical_plan::file_format::{plan_to_csv, plan_to_json, plan_to_parquet};
 use crate::physical_plan::planner::DefaultPhysicalPlanner;
@@ -180,7 +184,7 @@ impl SessionContext {
 
     /// Creates a new session context using the provided session configuration.
     pub fn with_config(config: SessionConfig) -> Self {
-        let runtime = Arc::new(RuntimeEnv::new(RuntimeConfig::default()).unwrap());
+        let runtime = Arc::new(RuntimeEnv::default());
         Self::with_config_rt(config, runtime)
     }
 
@@ -992,6 +996,37 @@ pub const REPARTITION_WINDOWS: &str = "repartition_windows";
 /// Session Configuration entry name for 'PARQUET_PRUNING'
 pub const PARQUET_PRUNING: &str = "parquet_pruning";
 
+/// Map that holds opaque objects indexed by their type.
+///
+/// Data is wrapped into an [`Arc`] to enable [`Clone`] while still being [object safe].
+///
+/// [object safe]: https://doc.rust-lang.org/reference/items/traits.html#object-safety
+type AnyMap =
+    HashMap<TypeId, Arc<dyn Any + Send + Sync + 'static>, BuildHasherDefault<IdHasher>>;
+
+/// Hasher for [`AnyMap`].
+///
+/// With [`TypeId`}s as keys, there's no need to hash them. They are already hashes themselves, coming from the compiler.
+/// The [`IdHasher`} just holds the [`u64`} of the [`TypeId`}, and then returns it, instead of doing any bit fiddling.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("TypeId calls write_u64");
+    }
+
+    #[inline]
+    fn write_u64(&mut self, id: u64) {
+        self.0 = id;
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// Configuration options for session context
 #[derive(Clone)]
 pub struct SessionConfig {
@@ -1019,6 +1054,8 @@ pub struct SessionConfig {
     pub parquet_pruning: bool,
     /// Configuration options
     pub config_options: ConfigOptions,
+    /// Opaque extensions.
+    extensions: AnyMap,
 }
 
 impl Default for SessionConfig {
@@ -1034,6 +1071,11 @@ impl Default for SessionConfig {
             repartition_windows: true,
             parquet_pruning: true,
             config_options: ConfigOptions::new(),
+            // Assume no extensions by default.
+            extensions: HashMap::with_capacity_and_hasher(
+                0,
+                BuildHasherDefault::default(),
+            ),
         }
     }
 }
@@ -1173,6 +1215,74 @@ impl SessionConfig {
         );
         map
     }
+
+    /// Add extensions.
+    ///
+    /// Extensions can be used to attach extra data to the session config -- e.g. tracing information or caches.
+    /// Extensions are opaque and the types are unknown to DataFusion itself, which makes them extremely flexible. [^1]
+    ///
+    /// Extensions are stored within an [`Arc`] so they do NOT require [`Clone`]. The are immutable. If you need to
+    /// modify their state over their lifetime -- e.g. for caches -- you need to establish some for of interior mutability.
+    ///
+    /// Extensions are indexed by their type `T`. If multiple values of the same type are provided, only the last one
+    /// will be kept.
+    ///
+    /// You may use [`get_extension`](Self::get_extension) to retrieve extensions.
+    ///
+    /// # Example
+    /// ```
+    /// use std::sync::Arc;
+    /// use datafusion::execution::context::SessionConfig;
+    ///
+    /// // application-specific extension types
+    /// struct Ext1(u8);
+    /// struct Ext2(u8);
+    /// struct Ext3(u8);
+    ///
+    /// let ext1a = Arc::new(Ext1(10));
+    /// let ext1b = Arc::new(Ext1(11));
+    /// let ext2 = Arc::new(Ext2(2));
+    ///
+    /// let cfg = SessionConfig::default()
+    ///     // will only remember the last Ext1
+    ///     .with_extension(Arc::clone(&ext1a))
+    ///     .with_extension(Arc::clone(&ext1b))
+    ///     .with_extension(Arc::clone(&ext2));
+    ///
+    /// let ext1_received = cfg.get_extension::<Ext1>().unwrap();
+    /// assert!(!Arc::ptr_eq(&ext1_received, &ext1a));
+    /// assert!(Arc::ptr_eq(&ext1_received, &ext1b));
+    ///
+    /// let ext2_received = cfg.get_extension::<Ext2>().unwrap();
+    /// assert!(Arc::ptr_eq(&ext2_received, &ext2));
+    ///
+    /// assert!(cfg.get_extension::<Ext3>().is_none());
+    /// ```
+    ///
+    /// [^1]: Compare that to [`ConfigOptions`] which only supports [`ScalarValue`] payloads.
+    pub fn with_extension<T>(mut self, ext: Arc<T>) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        let ext = ext as Arc<dyn Any + Send + Sync + 'static>;
+        let id = TypeId::of::<T>();
+        self.extensions.insert(id, ext);
+        self
+    }
+
+    /// Get extension, if any for the specified type `T` exists.
+    ///
+    /// See [`with_extension`](Self::with_extension) on how to add attach extensions.
+    pub fn get_extension<T>(&self) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        let id = TypeId::of::<T>();
+        self.extensions
+            .get(&id)
+            .cloned()
+            .map(|ext| Arc::downcast(ext).expect("TypeId unique"))
+    }
 }
 
 /// Execution context for registering data sources and executing queries
@@ -1211,10 +1321,7 @@ impl Debug for SessionState {
 
 /// Default session builder using the provided configuration
 pub fn default_session_builder(config: SessionConfig) -> SessionState {
-    SessionState::with_config_rt(
-        config,
-        Arc::new(RuntimeEnv::new(RuntimeConfig::default()).unwrap()),
-    )
+    SessionState::with_config_rt(config, Arc::new(RuntimeEnv::default()))
 }
 
 impl SessionState {
@@ -1371,7 +1478,11 @@ impl SessionState {
 
     /// Optimizes the logical plan by applying optimizer rules.
     pub fn optimize(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {
-        let mut optimizer_config = OptimizerConfig::new();
+        let mut optimizer_config = OptimizerConfig::new().with_skip_failing_rules(
+            self.config
+                .config_options
+                .get_bool(OPT_OPTIMIZER_SKIP_FAILED_RULES),
+        );
         optimizer_config.query_execution_start_time =
             self.execution_props.query_execution_start_time;
 
@@ -1381,7 +1492,7 @@ impl SessionState {
             // optimize the child plan, capturing the output of each optimizer
             let plan = self.optimizer.optimize(
                 e.plan.as_ref(),
-                &optimizer_config,
+                &mut optimizer_config,
                 |optimized_plan, optimizer| {
                     let optimizer_name = optimizer.name().to_string();
                     let plan_type = PlanType::OptimizedLogicalPlan { optimizer_name };
@@ -1396,7 +1507,8 @@ impl SessionState {
                 schema: e.schema.clone(),
             }))
         } else {
-            self.optimizer.optimize(plan, &optimizer_config, |_, _| {})
+            self.optimizer
+                .optimize(plan, &mut optimizer_config, |_, _| {})
         }
     }
 
@@ -1897,7 +2009,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_query_planner() -> Result<()> {
-        let runtime = Arc::new(RuntimeEnv::new(RuntimeConfig::default()).unwrap());
+        let runtime = Arc::new(RuntimeEnv::default());
         let session_state = SessionState::with_config_rt(SessionConfig::new(), runtime)
             .with_query_planner(Arc::new(MyQueryPlanner {}));
         let ctx = SessionContext::with_state(session_state);
