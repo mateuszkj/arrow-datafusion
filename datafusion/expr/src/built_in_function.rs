@@ -34,6 +34,8 @@ pub enum BuiltinScalarFunction {
     Asin,
     /// atan
     Atan,
+    /// atan2
+    Atan2,
     /// ceil
     Ceil,
     /// coalesce
@@ -90,6 +92,8 @@ pub enum BuiltinScalarFunction {
     DatePart,
     /// date_trunc
     DateTrunc,
+    /// date_bin
+    DateBin,
     /// initcap
     InitCap,
     /// left
@@ -181,6 +185,7 @@ impl BuiltinScalarFunction {
             BuiltinScalarFunction::Acos => Volatility::Immutable,
             BuiltinScalarFunction::Asin => Volatility::Immutable,
             BuiltinScalarFunction::Atan => Volatility::Immutable,
+            BuiltinScalarFunction::Atan2 => Volatility::Immutable,
             BuiltinScalarFunction::Ceil => Volatility::Immutable,
             BuiltinScalarFunction::Coalesce => Volatility::Immutable,
             BuiltinScalarFunction::Cos => Volatility::Immutable,
@@ -207,6 +212,7 @@ impl BuiltinScalarFunction {
             BuiltinScalarFunction::ConcatWithSeparator => Volatility::Immutable,
             BuiltinScalarFunction::DatePart => Volatility::Immutable,
             BuiltinScalarFunction::DateTrunc => Volatility::Immutable,
+            BuiltinScalarFunction::DateBin => Volatility::Immutable,
             BuiltinScalarFunction::InitCap => Volatility::Immutable,
             BuiltinScalarFunction::Left => Volatility::Immutable,
             BuiltinScalarFunction::Lpad => Volatility::Immutable,
@@ -268,6 +274,7 @@ impl FromStr for BuiltinScalarFunction {
             "acos" => BuiltinScalarFunction::Acos,
             "asin" => BuiltinScalarFunction::Asin,
             "atan" => BuiltinScalarFunction::Atan,
+            "atan2" => BuiltinScalarFunction::Atan2,
             "ceil" => BuiltinScalarFunction::Ceil,
             "cos" => BuiltinScalarFunction::Cos,
             "exp" => BuiltinScalarFunction::Exp,
@@ -299,6 +306,7 @@ impl FromStr for BuiltinScalarFunction {
             "chr" => BuiltinScalarFunction::Chr,
             "date_part" | "datepart" => BuiltinScalarFunction::DatePart,
             "date_trunc" | "datetrunc" => BuiltinScalarFunction::DateTrunc,
+            "date_bin" => BuiltinScalarFunction::DateBin,
             "initcap" => BuiltinScalarFunction::InitCap,
             "left" => BuiltinScalarFunction::Left,
             "length" => BuiltinScalarFunction::CharacterLength,

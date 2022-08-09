@@ -439,6 +439,8 @@ enum ScalarFunction {
   Power=64;
   StructFun=65;
   FromUnixtime=66;
+  Atan2=67;
+  DateBin=68;
 }
 
 message ScalarFunctionNode {
@@ -465,6 +467,7 @@ enum AggregateFunction {
   APPROX_MEDIAN=15;
   APPROX_PERCENTILE_CONT_WITH_WEIGHT = 16;
   GROUPING = 17;
+  MEDIAN=18;
 }
 
 message AggregateExprNode {

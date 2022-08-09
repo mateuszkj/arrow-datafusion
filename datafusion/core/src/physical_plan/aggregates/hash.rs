@@ -273,7 +273,7 @@ fn group_aggregate_batch(
         let mut offset_so_far = 0;
         for group_idx in groups_with_rows.iter() {
             let indices = &accumulators.group_states[*group_idx].indices;
-            batch_indices.append_slice(indices)?;
+            batch_indices.append_slice(indices);
             offset_so_far += indices.len();
             offsets.push(offset_so_far);
         }
@@ -428,8 +428,10 @@ fn create_batch_from_map(
                 AggregateMode::Partial => {
                     let res = ScalarValue::iter_to_array(
                         accumulators.group_states.iter().map(|group_state| {
-                            let x = group_state.accumulator_set[x].state().unwrap();
-                            x[y].clone()
+                            group_state.accumulator_set[x]
+                                .state()
+                                .and_then(|x| x[y].as_scalar().map(|v| v.clone()))
+                                .expect("unexpected accumulator state in hash aggregate")
                         }),
                     )?;
 

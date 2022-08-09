@@ -517,9 +517,9 @@ async fn query_get_indexed_field() -> Result<()> {
     for int_vec in vec![vec![0, 1, 2], vec![4, 5, 6], vec![7, 8, 9]] {
         let builder = lb.values();
         for int in int_vec {
-            builder.append_value(int).unwrap();
+            builder.append_value(int);
         }
-        lb.append(true).unwrap();
+        lb.append(true);
     }
 
     let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(lb.finish())])?;
@@ -568,11 +568,11 @@ async fn query_nested_get_indexed_field() -> Result<()> {
         for int_vec in int_vec_vec {
             let builder = nested_builder.values();
             for int in int_vec {
-                builder.append_value(int).unwrap();
+                builder.append_value(int);
             }
-            nested_builder.append(true).unwrap();
+            nested_builder.append(true);
         }
-        lb.append(true).unwrap();
+        lb.append(true);
     }
 
     let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(lb.finish())])?;
@@ -628,9 +628,9 @@ async fn query_nested_get_indexed_field_on_struct() -> Result<()> {
     for int_vec in vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]] {
         let lb = sb.field_builder::<ListBuilder<Int64Builder>>(0).unwrap();
         for int in int_vec {
-            lb.values().append_value(int).unwrap();
+            lb.values().append_value(int);
         }
-        lb.append(true).unwrap();
+        lb.append(true);
     }
     let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(sb.finish())])?;
     let table = MemTable::try_new(schema, vec![vec![data]])?;
@@ -1209,4 +1209,40 @@ async fn unprojected_filter() {
         "+--------------------------+",
     ];
     assert_batches_sorted_eq!(expected, &results);
+}
+
+#[tokio::test]
+async fn case_sensitive_in_default_dialect() {
+    let int32_array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+    let schema = Schema::new(vec![Field::new("INT32", DataType::Int32, false)]);
+    let batch =
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(int32_array)]).unwrap();
+
+    let ctx = SessionContext::new();
+    let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap();
+    ctx.register_table("t", Arc::new(table)).unwrap();
+
+    {
+        let sql = "select \"int32\" from t";
+        let plan = ctx.create_logical_plan(sql);
+        assert!(plan.is_err());
+    }
+
+    {
+        let sql = "select \"INT32\" from t";
+        let actual = execute_to_batches(&ctx, sql).await;
+
+        let expected = vec![
+            "+-------+",
+            "| INT32 |",
+            "+-------+",
+            "| 1     |",
+            "| 2     |",
+            "| 3     |",
+            "| 4     |",
+            "| 5     |",
+            "+-------+",
+        ];
+        assert_batches_eq!(expected, &actual);
+    }
 }

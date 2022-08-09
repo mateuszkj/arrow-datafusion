@@ -78,6 +78,7 @@ Here are some of the projects known to use DataFusion:
 
 - [Ballista](https://github.com/apache/arrow-ballista) Distributed SQL Query Engine
 - [Blaze](https://github.com/blaze-init/blaze) Spark accelerator with DataFusion at its core
+- [CeresDB](https://github.com/CeresDB/ceresdb) Distributed Time-Series Database
 - [Cloudfuse Buzz](https://github.com/cloudfuse-io/buzz-rust)
 - [CnosDB](https://github.com/cnosdb/cnosdb) Open Source Distributed Time Series Database
 - [Cube Store](https://github.com/cube-js/cube.js/tree/master/rust)
@@ -104,6 +105,7 @@ Please see [Roadmap](docs/source/specification/roadmap.md) for information of wh
 
 There is no formal document describing DataFusion's architecture yet, but the following presentations offer a good overview of its different components and how they interact together.
 
+- (July 2022): DataFusion and Arrow: Supercharge Your Data Analytical Tool with a Rusty Query Engine: [recording](https://www.youtube.com/watch?v=Rii1VTn3seQ)
 - (March 2021): The DataFusion architecture is described in _Query Engine Design and the Rust-Based DataFusion in Apache Arrow_: [recording](https://www.youtube.com/watch?v=K6eCAVEk4kU) (DataFusion content starts [~ 15 minutes in](https://www.youtube.com/watch?v=K6eCAVEk4kU&t=875s)) and [slides](https://www.slideshare.net/influxdata/influxdb-iox-tech-talks-query-engine-design-and-the-rustbased-datafusion-in-apache-arrow-244161934)
 - (February 2021): How DataFusion is used within the Ballista Project is described in \*Ballista: Distributed Compute with Rust and Apache Arrow: [recording](https://www.youtube.com/watch?v=ZZHQaOap9pQ)
 

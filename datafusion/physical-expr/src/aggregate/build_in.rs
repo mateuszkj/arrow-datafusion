@@ -244,13 +244,23 @@ pub fn create_aggregate_expr(
             ));
         }
         (AggregateFunction::ApproxMedian, false) => {
-            Arc::new(expressions::ApproxMedian::new(
+            Arc::new(expressions::ApproxMedian::try_new(
                 coerced_phy_exprs[0].clone(),
                 name,
                 return_type,
-            ))
+            )?)
         }
         (AggregateFunction::ApproxMedian, true) => {
+            return Err(DataFusionError::NotImplemented(
+                "APPROX_MEDIAN(DISTINCT) aggregations are not available".to_string(),
+            ));
+        }
+        (AggregateFunction::Median, false) => Arc::new(expressions::Median::new(
+            coerced_phy_exprs[0].clone(),
+            name,
+            return_type,
+        )),
+        (AggregateFunction::Median, true) => {
             return Err(DataFusionError::NotImplemented(
                 "MEDIAN(DISTINCT) aggregations are not available".to_string(),
             ));

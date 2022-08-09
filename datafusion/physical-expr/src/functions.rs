@@ -308,6 +308,9 @@ pub fn create_physical_fun(
         BuiltinScalarFunction::Power => {
             Arc::new(|args| make_scalar_function(math_expressions::power)(args))
         }
+        BuiltinScalarFunction::Atan2 => {
+            Arc::new(|args| make_scalar_function(math_expressions::atan2)(args))
+        }
 
         // string functions
         BuiltinScalarFunction::Array => Arc::new(array_expressions::array),
@@ -382,6 +385,7 @@ pub fn create_physical_fun(
         }
         BuiltinScalarFunction::DatePart => Arc::new(datetime_expressions::date_part),
         BuiltinScalarFunction::DateTrunc => Arc::new(datetime_expressions::date_trunc),
+        BuiltinScalarFunction::DateBin => Arc::new(datetime_expressions::date_bin),
         BuiltinScalarFunction::Now => {
             // bind value for now at plan time
             Arc::new(datetime_expressions::make_now(
@@ -1641,7 +1645,7 @@ mod tests {
         test_function!(
             Reverse,
             &[lit("loẅks")],
-            Ok(Some("skẅol")),
+            Ok(Some("sk̈wol")),
             &str,
             Utf8,
             StringArray
@@ -1650,7 +1654,7 @@ mod tests {
         test_function!(
             Reverse,
             &[lit("loẅks")],
-            Ok(Some("skẅol")),
+            Ok(Some("sk̈wol")),
             &str,
             Utf8,
             StringArray

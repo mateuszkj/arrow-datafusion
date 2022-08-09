@@ -32,12 +32,12 @@ use arrow::{
     datatypes::Field,
 };
 use datafusion_common::{DataFusionError, Result, ScalarValue};
-use datafusion_expr::Accumulator;
+use datafusion_expr::{Accumulator, AggregateState};
 
 use crate::aggregate::row_accumulator::RowAccumulator;
 use crate::expressions::format_state_name;
 use arrow::array::Array;
-use arrow::array::DecimalArray;
+use arrow::array::Decimal128Array;
 use arrow::compute::cast;
 use datafusion_row::accessor::RowAccessor;
 
@@ -157,7 +157,7 @@ fn sum_decimal_batch(
     precision: &usize,
     scale: &usize,
 ) -> Result<ScalarValue> {
-    let array = values.as_any().downcast_ref::<DecimalArray>().unwrap();
+    let array = values.as_any().downcast_ref::<Decimal128Array>().unwrap();
 
     if array.null_count() == array.len() {
         return Ok(ScalarValue::Decimal128(None, *precision, *scale));
@@ -435,8 +435,8 @@ pub(crate) fn add_to_row(
 }
 
 impl Accumulator for SumAccumulator {
-    fn state(&self) -> Result<Vec<ScalarValue>> {
-        Ok(vec![self.sum.clone()])
+    fn state(&self) -> Result<Vec<AggregateState>> {
+        Ok(vec![AggregateState::Scalar(self.sum.clone())])
     }
 
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
@@ -541,7 +541,7 @@ mod tests {
         let array: ArrayRef = Arc::new(
             (1..6)
                 .map(Some)
-                .collect::<DecimalArray>()
+                .collect::<Decimal128Array>()
                 .with_precision_and_scale(10, 0)?,
         );
         let result = sum_batch(&array, &DataType::Decimal(10, 0))?;
@@ -551,7 +551,7 @@ mod tests {
         let array: ArrayRef = Arc::new(
             (1..6)
                 .map(Some)
-                .collect::<DecimalArray>()
+                .collect::<Decimal128Array>()
                 .with_precision_and_scale(10, 0)?,
         );
 
@@ -576,7 +576,7 @@ mod tests {
         let array: ArrayRef = Arc::new(
             (1..6)
                 .map(|i| if i == 2 { None } else { Some(i) })
-                .collect::<DecimalArray>()
+                .collect::<Decimal128Array>()
                 .with_precision_and_scale(10, 0)?,
         );
         let result = sum_batch(&array, &DataType::Decimal(10, 0))?;
@@ -586,7 +586,7 @@ mod tests {
         let array: ArrayRef = Arc::new(
             (1..6)
                 .map(|i| if i == 2 { None } else { Some(i) })
-                .collect::<DecimalArray>()
+                .collect::<Decimal128Array>()
                 .with_precision_and_scale(35, 0)?,
         );
         generic_test_op!(
@@ -610,7 +610,7 @@ mod tests {
         let array: ArrayRef = Arc::new(
             std::iter::repeat(None)
                 .take(6)
-                .collect::<DecimalArray>()
+                .collect::<Decimal128Array>()
                 .with_precision_and_scale(10, 0)?,
         );
         let result = sum_batch(&array, &DataType::Decimal(10, 0))?;

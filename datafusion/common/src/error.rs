@@ -23,9 +23,9 @@ use std::io;
 use std::result;
 
 use crate::DFSchema;
-use arrow::error::ArrowError;
 #[cfg(feature = "avro")]
-use avro_rs::Error as AvroError;
+use apache_avro::Error as AvroError;
+use arrow::error::ArrowError;
 #[cfg(feature = "jit")]
 use cranelift_module::ModuleError;
 #[cfg(feature = "parquet")]
@@ -83,6 +83,30 @@ pub enum DataFusionError {
     #[cfg(feature = "jit")]
     /// Error occurs during code generation
     JITError(ModuleError),
+    /// Error with additional context
+    Context(String, Box<DataFusionError>),
+}
+
+#[macro_export]
+macro_rules! context {
+    ($desc:expr, $err:expr) => {
+        datafusion_common::DataFusionError::Context(
+            format!("{} at {}:{}", $desc, file!(), line!()),
+            Box::new($err),
+        )
+    };
+}
+
+#[macro_export]
+macro_rules! plan_err {
+    ($desc:expr) => {
+        Err(datafusion_common::DataFusionError::Plan(format!(
+            "{} at {}:{}",
+            $desc,
+            file!(),
+            line!()
+        )))
+    };
 }
 
 /// Schema-related errors
@@ -284,6 +308,9 @@ impl Display for DataFusionError {
             #[cfg(feature = "object_store")]
             DataFusionError::ObjectStore(ref desc) => {
                 write!(f, "Object Store error: {}", desc)
+            }
+            DataFusionError::Context(ref desc, ref err) => {
+                write!(f, "{}\ncaused by\n{}", desc, *err)
             }
         }
     }

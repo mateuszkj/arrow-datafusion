@@ -17,6 +17,7 @@
 
 //! SQL Query Planner (produces logical plan from SQL AST)
 
+use crate::interval::parse_interval;
 use crate::parser::{CreateExternalTable, DescribeTable, Statement as DFStatement};
 use arrow::datatypes::*;
 use datafusion_common::ToDFSchema;
@@ -42,7 +43,6 @@ use datafusion_expr::{
 };
 use hashbrown::HashMap;
 use std::collections::HashSet;
-use std::iter;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{convert::TryInto, vec};
@@ -98,7 +98,9 @@ fn plan_key(key: SQLExpr) -> Result<ScalarValue> {
         SQLExpr::Value(Value::Number(s, _)) => {
             ScalarValue::Int64(Some(s.parse().unwrap()))
         }
-        SQLExpr::Value(Value::SingleQuotedString(s)) => ScalarValue::Utf8(Some(s)),
+        SQLExpr::Value(Value::SingleQuotedString(s) | Value::DoubleQuotedString(s)) => {
+            ScalarValue::Utf8(Some(s))
+        }
         _ => {
             return Err(DataFusionError::SQL(ParserError(format!(
                 "Unsuported index key expression: {:?}",
@@ -302,7 +304,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 ctes.insert(cte_name, logical_plan);
             }
         }
-        let plan = self.set_expr_to_plan(set_expr, alias, ctes, outer_query_schema)?;
+        let plan = self.set_expr_to_plan(*set_expr, alias, ctes, outer_query_schema)?;
 
         let plan = self.order_by(plan, query.order_by)?;
         self.limit(plan, query.offset, query.limit)
@@ -727,9 +729,12 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     alias,
                 )
             }
-            TableFactor::NestedJoin(table_with_joins) => (
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+            } => (
                 self.plan_table_with_joins(*table_with_joins, ctes, outer_query_schema)?,
-                None,
+                alias,
             ),
             // @todo Support TableFactory::TableFunction?
             _ => {
@@ -1593,7 +1598,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 row.into_iter()
                     .map(|v| match v {
                         SQLExpr::Value(Value::Number(n, _)) => parse_sql_number(&n),
-                        SQLExpr::Value(Value::SingleQuotedString(s)) => Ok(lit(s)),
+                        SQLExpr::Value(
+                            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+                        ) => Ok(lit(s)),
                         SQLExpr::Value(Value::Null) => {
                             Ok(Expr::Literal(ScalarValue::Null))
                         }
@@ -1612,6 +1619,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                                 &schema,
                                 &mut HashMap::new(),
                             ),
+                        SQLExpr::TypedString { data_type, value } => Ok(Expr::Cast {
+                            expr: Box::new(lit(value)),
+                            data_type: convert_data_type(&data_type)?,
+                        }),
                         other => Err(DataFusionError::NotImplemented(format!(
                             "Unsupported value {:?} in a values list expression",
                             other
@@ -1631,7 +1642,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     ) -> Result<Expr> {
         match sql {
             SQLExpr::Value(Value::Number(n, _)) => parse_sql_number(&n),
-            SQLExpr::Value(Value::SingleQuotedString(ref s)) => Ok(lit(s.clone())),
+            SQLExpr::Value(Value::SingleQuotedString(ref s) | Value::DoubleQuotedString(ref s)) => Ok(lit(s.clone())),
             SQLExpr::Value(Value::Boolean(n)) => Ok(lit(n)),
             SQLExpr::Value(Value::Null) => Ok(Expr::Literal(ScalarValue::Null)),
             SQLExpr::Extract { field, expr } => Ok(Expr::ScalarFunction {
@@ -1649,7 +1660,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 last_field,
                 fractional_seconds_precision,
             }) => self.sql_interval_to_literal(
-                value,
+                *value,
                 leading_field,
                 leading_precision,
                 last_field,
@@ -1717,18 +1728,34 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 } else {
                     match (var_names.pop(), var_names.pop()) {
                         (Some(name), Some(relation)) if var_names.is_empty() => {
-                            if let Some(field) = schema.fields().iter().find(|f| f.name().eq(&relation)) {
-                                // Access to a field of a column which is a structure, example: SELECT my_struct.key
-                                Ok(Expr::GetIndexedField {
-                                    expr: Box::new(Expr::Column(field.qualified_column())),
-                                    key: ScalarValue::Utf8(Some(name)),
-                                })
-                            } else {
-                                // table.column identifier
-                                Ok(Expr::Column(Column {
-                                    relation: Some(relation),
-                                    name,
-                                }))
+                            match schema.field_with_qualified_name(&relation, &name) {
+                                Ok(_) => {
+                                    // found an exact match on a qualified name so this is a table.column identifier
+                                    Ok(Expr::Column(Column {
+                                        relation: Some(relation),
+                                        name,
+                                    }))
+                                },
+                                Err(e) => {
+                                    let search_term = format!(".{}.{}", relation, name);
+                                    if schema.field_names().iter().any(|name| name.as_str().ends_with(&search_term)) {
+                                        // this could probably be improved but here we handle the case
+                                        // where the qualifier is only a partial qualifier such as when
+                                        // referencing "t1.foo" when the available field is "public.t1.foo"
+                                        Ok(Expr::Column(Column {
+                                            relation: Some(relation),
+                                            name,
+                                        }))
+                                    } else if let Some(field) = schema.fields().iter().find(|f| f.name().eq(&relation)) {
+                                        // Access to a field of a column which is a structure, example: SELECT my_struct.key
+                                        Ok(Expr::GetIndexedField {
+                                            expr: Box::new(Expr::Column(field.qualified_column())),
+                                            key: ScalarValue::Utf8(Some(name)),
+                                        })
+                                    } else {
+                                        Err(e)
+                                    }
+                                }
                             }
                         }
                         _ => Err(DataFusionError::NotImplemented(format!(
@@ -1792,11 +1819,11 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }),
 
             SQLExpr::TypedString {
-                ref data_type,
-                ref value,
+                data_type,
+                value,
             } => Ok(Expr::Cast {
-                expr: Box::new(lit(&**value)),
-                data_type: convert_data_type(data_type)?,
+                expr: Box::new(lit(value)),
+                data_type: convert_data_type(&data_type)?,
             }),
 
             SQLExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(
@@ -1820,13 +1847,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }),
 
 
-            SQLExpr::UnaryOp { op, expr } => match (&op, expr.as_ref()) {
-                // The AST for Exists does not support the NOT EXISTS case so it gets
-                // wrapped in a unary NOT
-                // https://github.com/sqlparser-rs/sqlparser-rs/issues/472
-                (&UnaryOperator::Not, &SQLExpr::Exists(ref subquery)) => self.parse_exists_subquery(subquery, true, schema, ctes),
-                _ => self.parse_sql_unary_op(op, *expr, schema, ctes)
-            }
+            SQLExpr::UnaryOp { op, expr } => self.parse_sql_unary_op(op, *expr, schema, ctes),
 
             SQLExpr::Between {
                 expr,
@@ -2066,7 +2087,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
             SQLExpr::Nested(e) => self.sql_expr_to_logical_expr(*e, schema, ctes),
 
-            SQLExpr::Exists(subquery) => self.parse_exists_subquery(&subquery, false, schema, ctes),
+            SQLExpr::Exists{ subquery, negated } => self.parse_exists_subquery(&subquery, negated, schema, ctes),
 
             SQLExpr::InSubquery {  expr, subquery, negated } => self.parse_in_subquery(&expr, &subquery, negated, schema, ctes),
 
@@ -2165,18 +2186,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     _ => self.sql_fn_arg_to_logical_expr(a, schema, &mut HashMap::new()),
                 })
                 .collect::<Result<Vec<Expr>>>()?,
-            AggregateFunction::ApproxMedian => function
-                .args
-                .into_iter()
-                .map(|a| self.sql_fn_arg_to_logical_expr(a, schema, &mut HashMap::new()))
-                .chain(iter::once(Ok(lit(0.5_f64))))
-                .collect::<Result<Vec<Expr>>>()?,
             _ => self.function_args_to_expr(function.args, schema)?,
-        };
-
-        let fun = match fun {
-            AggregateFunction::ApproxMedian => AggregateFunction::ApproxPercentileCont,
-            _ => fun,
         };
 
         Ok((fun, args))
@@ -2184,7 +2194,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
     fn sql_interval_to_literal(
         &self,
-        value: String,
+        value: SQLExpr,
         leading_field: Option<DateTimeField>,
         leading_precision: Option<u64>,
         last_field: Option<DateTimeField>,
@@ -2211,146 +2221,25 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             )));
         }
 
-        const SECONDS_PER_HOUR: f32 = 3_600_f32;
-        const MILLIS_PER_SECOND: f32 = 1_000_f32;
-
-        // We are storing parts as integers, it's why we need to align parts fractional
-        // INTERVAL '0.5 MONTH' = 15 days, INTERVAL '1.5 MONTH' = 1 month 15 days
-        // INTERVAL '0.5 DAY' = 12 hours, INTERVAL '1.5 DAY' = 1 day 12 hours
-        let align_interval_parts = |month_part: f32,
-                                    mut day_part: f32,
-                                    mut milles_part: f32|
-         -> (i32, i32, f32) {
-            // Convert fractional month to days, It's not supported by Arrow types, but anyway
-            day_part += (month_part - (month_part as i32) as f32) * 30_f32;
-
-            // Convert fractional days to hours
-            milles_part += (day_part - ((day_part as i32) as f32))
-                * 24_f32
-                * SECONDS_PER_HOUR
-                * MILLIS_PER_SECOND;
-
-            (month_part as i32, day_part as i32, milles_part)
-        };
-
-        let calculate_from_part = |interval_period_str: &str,
-                                   interval_type: &str|
-         -> Result<(i32, i32, f32)> {
-            // @todo It's better to use Decimal in order to protect rounding errors
-            // Wait https://github.com/apache/arrow/pull/9232
-            let interval_period = match f32::from_str(interval_period_str) {
-                Ok(n) => n,
-                Err(_) => {
-                    return Err(DataFusionError::SQL(ParserError(format!(
-                        "Unsupported Interval Expression with value {:?}",
-                        value
-                    ))));
-                }
-            };
-
-            if interval_period > (i32::MAX as f32) {
+        // Only handle string exprs for now
+        let value = match value {
+            SQLExpr::Value(
+                Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+            ) => s,
+            _ => {
                 return Err(DataFusionError::NotImplemented(format!(
-                    "Interval field value out of range: {:?}",
+                    "Unsupported interval argument. Expected string literal, got: {:?}",
                     value
-                )));
-            }
-
-            match interval_type.to_lowercase().as_str() {
-                "year" => Ok(align_interval_parts(interval_period * 12_f32, 0.0, 0.0)),
-                "month" => Ok(align_interval_parts(interval_period, 0.0, 0.0)),
-                "day" | "days" => Ok(align_interval_parts(0.0, interval_period, 0.0)),
-                "hour" | "hours" => {
-                    Ok((0, 0, interval_period * SECONDS_PER_HOUR * MILLIS_PER_SECOND))
-                }
-                "minutes" | "minute" => {
-                    Ok((0, 0, interval_period * 60_f32 * MILLIS_PER_SECOND))
-                }
-                "seconds" | "second" => Ok((0, 0, interval_period * MILLIS_PER_SECOND)),
-                "milliseconds" | "millisecond" => Ok((0, 0, interval_period)),
-                _ => Err(DataFusionError::NotImplemented(format!(
-                    "Invalid input syntax for type interval: {:?}",
-                    value
-                ))),
+                )))
             }
         };
 
-        let mut result_month: i64 = 0;
-        let mut result_days: i64 = 0;
-        let mut result_millis: i64 = 0;
+        let leading_field = leading_field
+            .as_ref()
+            .map(|dt| dt.to_string())
+            .unwrap_or_else(|| "second".to_string());
 
-        let mut parts = value.split_whitespace();
-
-        loop {
-            let interval_period_str = parts.next();
-            if interval_period_str.is_none() {
-                break;
-            }
-
-            let leading_field = leading_field
-                .as_ref()
-                .map(|dt| dt.to_string())
-                .unwrap_or_else(|| "second".to_string());
-
-            let unit = parts
-                .next()
-                .map(|part| part.to_string())
-                .unwrap_or(leading_field);
-
-            let (diff_month, diff_days, diff_millis) =
-                calculate_from_part(interval_period_str.unwrap(), &unit)?;
-
-            result_month += diff_month as i64;
-
-            if result_month > (i32::MAX as i64) {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "Interval field value out of range: {:?}",
-                    value
-                )));
-            }
-
-            result_days += diff_days as i64;
-
-            if result_days > (i32::MAX as i64) {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "Interval field value out of range: {:?}",
-                    value
-                )));
-            }
-
-            result_millis += diff_millis as i64;
-
-            if result_millis > (i32::MAX as i64) {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "Interval field value out of range: {:?}",
-                    value
-                )));
-            }
-        }
-
-        // Interval is tricky thing
-        // 1 day is not 24 hours because timezones, 1 year != 365/364! 30 days != 1 month
-        // The true way to store and calculate intervals is to store it as it defined
-        // It's why we there are 3 different interval types in Arrow
-        if result_month != 0 && (result_days != 0 || result_millis != 0) {
-            let result: i128 = ((result_month as i128) << 96)
-                | ((result_days as i128) << 64)
-                // IntervalMonthDayNano uses nanos, but IntervalDayTime uses milles
-                | ((result_millis * 1_000_000_i64) as i128);
-
-            return Ok(Expr::Literal(ScalarValue::IntervalMonthDayNano(Some(
-                result,
-            ))));
-        }
-
-        // Month interval
-        if result_month != 0 {
-            return Ok(Expr::Literal(ScalarValue::IntervalYearMonth(Some(
-                result_month as i32,
-            ))));
-        }
-
-        let result: i64 = (result_days << 32) | result_millis;
-        Ok(Expr::Literal(ScalarValue::IntervalDayTime(Some(result))))
+        Ok(lit(parse_interval(&leading_field, &value)?))
     }
 
     fn show_variable_to_plan(&self, variable: &[Ident]) -> Result<LogicalPlan> {
@@ -2712,6 +2601,7 @@ fn parse_sql_number(n: &str) -> Result<Expr> {
 mod tests {
     use super::*;
     use crate::assert_contains;
+    use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect};
     use std::any::Any;
 
     #[test]
@@ -3360,6 +3250,17 @@ mod tests {
     }
 
     #[test]
+    fn select_from_typed_string_values() {
+        quick_test(
+            "SELECT col1, col2 FROM (VALUES (TIMESTAMP '2021-06-10 17:01:00Z', DATE '2004-04-09')) as t (col1, col2)",
+            "Projection: #t.col1, #t.col2\
+            \n  Projection: #t.column1 AS col1, #t.column2 AS col2, alias=t\
+            \n    Projection: #column1, #column2, alias=t\
+            \n      Values: (CAST(Utf8(\"2021-06-10 17:01:00Z\") AS Timestamp(Nanosecond, None)), CAST(Utf8(\"2004-04-09\") AS Date32))",
+        );
+    }
+
+    #[test]
     fn select_simple_aggregate_repeated_aggregate_with_repeated_aliases() {
         let sql = "SELECT MIN(age) AS a, MIN(age) AS a FROM person";
         let err = logical_plan(sql).expect_err("query should have failed");
@@ -3661,8 +3562,8 @@ mod tests {
     #[test]
     fn select_approx_median() {
         let sql = "SELECT approx_median(age) FROM person";
-        let expected = "Projection: #APPROXPERCENTILECONT(person.age,Float64(0.5))\
-                        \n  Aggregate: groupBy=[[]], aggr=[[APPROXPERCENTILECONT(#person.age, Float64(0.5))]]\
+        let expected = "Projection: #APPROXMEDIAN(person.age)\
+                        \n  Aggregate: groupBy=[[]], aggr=[[APPROXMEDIAN(#person.age)]]\
                         \n    TableScan: person";
         quick_test(sql, expected);
     }
@@ -4454,8 +4355,8 @@ mod tests {
         let sql =
             "SELECT order_id, APPROX_MEDIAN(qty) OVER(PARTITION BY order_id) from orders";
         let expected = "\
-        Projection: #orders.order_id, #APPROXPERCENTILECONT(orders.qty,Float64(0.5)) PARTITION BY [#orders.order_id]\
-        \n  WindowAggr: windowExpr=[[APPROXPERCENTILECONT(#orders.qty, Float64(0.5)) PARTITION BY [#orders.order_id]]]\
+        Projection: #orders.order_id, #APPROXMEDIAN(orders.qty) PARTITION BY [#orders.order_id]\
+        \n  WindowAggr: windowExpr=[[APPROXMEDIAN(#orders.qty) PARTITION BY [#orders.order_id]]]\
         \n    TableScan: orders";
         quick_test(sql, expected);
     }
@@ -4477,8 +4378,16 @@ mod tests {
     }
 
     fn logical_plan(sql: &str) -> Result<LogicalPlan> {
+        let dialect = &GenericDialect {};
+        logical_plan_with_dialect(sql, dialect)
+    }
+
+    fn logical_plan_with_dialect(
+        sql: &str,
+        dialect: &dyn Dialect,
+    ) -> Result<LogicalPlan> {
         let planner = SqlToRel::new(&MockContextProvider {});
-        let result = DFParser::parse_sql(sql);
+        let result = DFParser::parse_sql_with_dialect(sql, dialect);
         let mut ast = result?;
         planner.statement_to_plan(ast.pop_front().unwrap())
     }
@@ -4944,6 +4853,24 @@ mod tests {
         \n    Filter: #person.id > Int64(100)\
         \n      TableScan: person";
         quick_test(sql, expected);
+    }
+
+    #[test]
+    fn test_double_quoted_literal_string() {
+        // Assert double quoted literal string is parsed correctly like single quoted one in specific dialect.
+        let dialect = &MySqlDialect {};
+        let single_quoted_res = format!(
+            "{:?}",
+            logical_plan_with_dialect("SELECT '1'", dialect).unwrap()
+        );
+        let double_quoted_res = format!(
+            "{:?}",
+            logical_plan_with_dialect("SELECT \"1\"", dialect).unwrap()
+        );
+        assert_eq!(single_quoted_res, double_quoted_res);
+
+        // It should return error in other dialect.
+        assert!(logical_plan("SELECT \"1\"").is_err());
     }
 
     fn assert_field_not_found(err: DataFusionError, name: &str) {

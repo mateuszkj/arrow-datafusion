@@ -39,23 +39,24 @@ use crate::datasource::listing::{FileRange, PartitionedFile};
 use crate::error::Result;
 use crate::execution::context::TaskContext;
 use crate::physical_plan::file_format::{FileScanConfig, PartitionColumnProjector};
+use crate::physical_plan::metrics::BaselineMetrics;
 use crate::physical_plan::RecordBatchStream;
 
 /// A fallible future that resolves to a stream of [`RecordBatch`]
-pub type ReaderFuture =
+pub type FileOpenFuture =
     BoxFuture<'static, Result<BoxStream<'static, ArrowResult<RecordBatch>>>>;
 
-pub trait FormatReader: Unpin {
+pub trait FileOpener: Unpin {
     fn open(
         &self,
         store: Arc<dyn ObjectStore>,
         file: ObjectMeta,
         range: Option<FileRange>,
-    ) -> ReaderFuture;
+    ) -> FileOpenFuture;
 }
 
 /// A stream that iterates record batch by record batch, file over file.
-pub struct FileStream<F: FormatReader> {
+pub struct FileStream<F: FileOpener> {
     /// An iterator over input files.
     file_iter: VecDeque<PartitionedFile>,
     /// The stream schema (file schema including partition columns and after
@@ -74,6 +75,8 @@ pub struct FileStream<F: FormatReader> {
     object_store: Arc<dyn ObjectStore>,
     /// The stream state
     state: FileStreamState,
+    /// runtime metrics recording
+    baseline_metrics: BaselineMetrics,
 }
 
 enum FileStreamState {
@@ -82,12 +85,12 @@ enum FileStreamState {
     /// Currently performing asynchronous IO to obtain a stream of RecordBatch
     /// for a given parquet file
     Open {
-        /// A [`ReaderFuture`] returned by [`FormatReader::open`]
-        future: ReaderFuture,
+        /// A [`FileOpenFuture`] returned by [`FormatReader::open`]
+        future: FileOpenFuture,
         /// The partition values for this file
         partition_values: Vec<ScalarValue>,
     },
-    /// Scanning the [`BoxStream`] returned by the completion of a [`ReaderFuture`]
+    /// Scanning the [`BoxStream`] returned by the completion of a [`FileOpenFuture`]
     /// returned by [`FormatReader::open`]
     Scan {
         /// Partitioning column values for the current batch_iter
@@ -101,12 +104,13 @@ enum FileStreamState {
     Limit,
 }
 
-impl<F: FormatReader> FileStream<F> {
+impl<F: FileOpener> FileStream<F> {
     pub fn new(
         config: &FileScanConfig,
         partition: usize,
         context: Arc<TaskContext>,
         file_reader: F,
+        baseline_metrics: BaselineMetrics,
     ) -> Result<Self> {
         let (projected_schema, _) = config.project();
         let pc_projector = PartitionColumnProjector::new(
@@ -128,6 +132,7 @@ impl<F: FormatReader> FileStream<F> {
             pc_projector,
             object_store,
             state: FileStreamState::Idle,
+            baseline_metrics,
         })
     }
 
@@ -207,18 +212,22 @@ impl<F: FormatReader> FileStream<F> {
     }
 }
 
-impl<F: FormatReader> Stream for FileStream<F> {
+impl<F: FileOpener> Stream for FileStream<F> {
     type Item = ArrowResult<RecordBatch>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        self.poll_inner(cx)
+        let cloned_time = self.baseline_metrics.elapsed_compute().clone();
+        let timer = cloned_time.timer();
+        let result = self.poll_inner(cx);
+        timer.done();
+        self.baseline_metrics.record_poll(result)
     }
 }
 
-impl<F: FormatReader> RecordBatchStream for FileStream<F> {
+impl<F: FileOpener> RecordBatchStream for FileStream<F> {
     fn schema(&self) -> SchemaRef {
         self.projected_schema.clone()
     }
@@ -230,6 +239,7 @@ mod tests {
 
     use super::*;
     use crate::datasource::object_store::ObjectStoreUrl;
+    use crate::physical_plan::metrics::ExecutionPlanMetricsSet;
     use crate::prelude::SessionContext;
     use crate::{
         error::Result,
@@ -240,13 +250,13 @@ mod tests {
         records: Vec<RecordBatch>,
     }
 
-    impl FormatReader for TestOpener {
+    impl FileOpener for TestOpener {
         fn open(
             &self,
             _store: Arc<dyn ObjectStore>,
             _file: ObjectMeta,
             _range: Option<FileRange>,
-        ) -> ReaderFuture {
+        ) -> FileOpenFuture {
             let iterator = self.records.clone().into_iter().map(Ok);
             let stream = futures::stream::iter(iterator).boxed();
             futures::future::ready(Ok(stream)).boxed()
@@ -276,7 +286,9 @@ mod tests {
             table_partition_cols: vec![],
         };
 
-        let file_stream = FileStream::new(&config, 0, ctx.task_ctx(), reader).unwrap();
+        let metrics = BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let file_stream =
+            FileStream::new(&config, 0, ctx.task_ctx(), reader, metrics).unwrap();
 
         file_stream
             .map(|b| b.expect("No error expected in stream"))

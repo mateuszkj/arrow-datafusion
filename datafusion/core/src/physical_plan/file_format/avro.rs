@@ -24,6 +24,9 @@ use crate::physical_plan::{
 use arrow::datatypes::SchemaRef;
 
 use crate::execution::context::TaskContext;
+#[cfg(feature = "avro")]
+use crate::physical_plan::metrics::BaselineMetrics;
+use crate::physical_plan::metrics::ExecutionPlanMetricsSet;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -31,10 +34,13 @@ use super::FileScanConfig;
 
 /// Execution plan for scanning Avro data source
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct AvroExec {
     base_config: FileScanConfig,
     projected_statistics: Statistics,
     projected_schema: SchemaRef,
+    /// Execution metrics
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl AvroExec {
@@ -46,6 +52,7 @@ impl AvroExec {
             base_config,
             projected_schema,
             projected_statistics,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
     /// Ref to the base configs
@@ -104,7 +111,6 @@ impl ExecutionPlan for AvroExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         use super::file_stream::FileStream;
-
         let config = Arc::new(private::AvroConfig {
             schema: Arc::clone(&self.base_config.file_schema),
             batch_size: context.session_config().batch_size(),
@@ -112,7 +118,13 @@ impl ExecutionPlan for AvroExec {
         });
         let opener = private::AvroOpener { config };
 
-        let stream = FileStream::new(&self.base_config, partition, context, opener)?;
+        let stream = FileStream::new(
+            &self.base_config,
+            partition,
+            context,
+            opener,
+            BaselineMetrics::new(&self.metrics, partition),
+        )?;
         Ok(Box::pin(stream))
     }
 
@@ -142,7 +154,7 @@ impl ExecutionPlan for AvroExec {
 mod private {
     use super::*;
     use crate::datasource::listing::FileRange;
-    use crate::physical_plan::file_format::file_stream::{FormatReader, ReaderFuture};
+    use crate::physical_plan::file_format::file_stream::{FileOpenFuture, FileOpener};
     use bytes::Buf;
     use futures::StreamExt;
     use object_store::{GetResult, ObjectMeta, ObjectStore};
@@ -171,13 +183,13 @@ mod private {
         pub config: Arc<AvroConfig>,
     }
 
-    impl FormatReader for AvroOpener {
+    impl FileOpener for AvroOpener {
         fn open(
             &self,
             store: Arc<dyn ObjectStore>,
             file: ObjectMeta,
             _range: Option<FileRange>,
-        ) -> ReaderFuture {
+        ) -> FileOpenFuture {
             let config = self.config.clone();
             Box::pin(async move {
                 match store.get(&file.location).await? {

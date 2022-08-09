@@ -223,6 +223,9 @@ impl From<&DataType> for protobuf::arrow_type::ArrowTypeEnum {
                 whole: *whole as u64,
                 fractional: *fractional as u64,
             }),
+            DataType::Decimal256(_, _) => {
+                unimplemented!("The Decimal256 data type is not yet supported")
+            }
             DataType::Map(_, _) => {
                 unimplemented!("The Map data type is not yet supported")
             }
@@ -351,6 +354,7 @@ impl From<&AggregateFunction> for protobuf::AggregateFunction {
             }
             AggregateFunction::ApproxMedian => Self::ApproxMedian,
             AggregateFunction::Grouping => Self::Grouping,
+            AggregateFunction::Median => Self::Median,
         }
     }
 }
@@ -537,6 +541,7 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
                         protobuf::AggregateFunction::ApproxMedian
                     }
                     AggregateFunction::Grouping => protobuf::AggregateFunction::Grouping,
+                    AggregateFunction::Median => protobuf::AggregateFunction::Median,
                 };
 
                 let aggregate_expr = protobuf::AggregateExprNode {
@@ -1082,6 +1087,7 @@ impl TryFrom<&BuiltinScalarFunction> for protobuf::ScalarFunction {
             BuiltinScalarFunction::NullIf => Self::NullIf,
             BuiltinScalarFunction::DatePart => Self::DatePart,
             BuiltinScalarFunction::DateTrunc => Self::DateTrunc,
+            BuiltinScalarFunction::DateBin => Self::DateBin,
             BuiltinScalarFunction::MD5 => Self::Md5,
             BuiltinScalarFunction::SHA224 => Self::Sha224,
             BuiltinScalarFunction::SHA256 => Self::Sha256,
@@ -1121,6 +1127,7 @@ impl TryFrom<&BuiltinScalarFunction> for protobuf::ScalarFunction {
             BuiltinScalarFunction::Power => Self::Power,
             BuiltinScalarFunction::Struct => Self::StructFun,
             BuiltinScalarFunction::FromUnixtime => Self::FromUnixtime,
+            BuiltinScalarFunction::Atan2 => Self::Atan2,
         };
 
         Ok(scalar_function)
@@ -1237,7 +1244,8 @@ impl TryFrom<&DataType> for protobuf::scalar_type::Datatype {
             | DataType::Union(_, _, _)
             | DataType::Dictionary(_, _)
             | DataType::Map(_, _)
-            | DataType::Decimal(_, _) => {
+            | DataType::Decimal(_, _)
+            | DataType::Decimal256(_, _) => {
                 return Err(Error::invalid_scalar_type(val));
             }
         };
