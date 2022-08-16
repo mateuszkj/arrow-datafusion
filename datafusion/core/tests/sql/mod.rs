@@ -105,6 +105,7 @@ pub mod union;
 pub mod wildcard;
 pub mod window;
 
+pub mod arrow_typeof;
 pub mod decimal;
 mod explain;
 mod idenfifers;
@@ -630,7 +631,7 @@ async fn register_aggregate_csv_by_sql(ctx: &SessionContext) {
         c2  INT NOT NULL,
         c3  SMALLINT NOT NULL,
         c4  SMALLINT NOT NULL,
-        c5  INT NOT NULL,
+        c5  INTEGER NOT NULL,
         c6  BIGINT NOT NULL,
         c7  SMALLINT NOT NULL,
         c8  INT NOT NULL,
