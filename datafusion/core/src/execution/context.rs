@@ -106,6 +106,7 @@ use datafusion_optimizer::decorrelate_scalar_subquery::DecorrelateScalarSubquery
 use datafusion_optimizer::decorrelate_where_exists::DecorrelateWhereExists;
 use datafusion_optimizer::decorrelate_where_in::DecorrelateWhereIn;
 use datafusion_optimizer::filter_null_join_keys::FilterNullJoinKeys;
+use datafusion_optimizer::pre_cast_lit_in_comparison::PreCastLitInComparisonExpressions;
 use datafusion_optimizer::rewrite_disjunctive_predicate::RewriteDisjunctivePredicate;
 use datafusion_sql::{
     parser::DFParser,
@@ -365,20 +366,18 @@ impl SessionContext {
                 match (or_replace, view) {
                     (true, Ok(_)) => {
                         self.deregister_table(name.as_str())?;
-                        let plan = self.optimize(&input)?;
                         let table =
-                            Arc::new(ViewTable::try_new(plan.clone(), definition)?);
+                            Arc::new(ViewTable::try_new((*input).clone(), definition)?);
 
                         self.register_table(name.as_str(), table)?;
-                        Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
+                        Ok(Arc::new(DataFrame::new(self.state.clone(), &input)))
                     }
                     (_, Err(_)) => {
-                        let plan = self.optimize(&input)?;
                         let table =
-                            Arc::new(ViewTable::try_new(plan.clone(), definition)?);
+                            Arc::new(ViewTable::try_new((*input).clone(), definition)?);
 
                         self.register_table(name.as_str(), table)?;
-                        Ok(Arc::new(DataFrame::new(self.state.clone(), &plan)))
+                        Ok(Arc::new(DataFrame::new(self.state.clone(), &input)))
                     }
                     (false, Ok(_)) => Err(DataFusionError::Execution(format!(
                         "Table '{:?}' already exists",
@@ -1360,6 +1359,7 @@ impl SessionState {
             // Simplify expressions first to maximize the chance
             // of applying other optimizations
             Arc::new(SimplifyExpressions::new()),
+            Arc::new(PreCastLitInComparisonExpressions::new()),
             Arc::new(DecorrelateWhereExists::new()),
             Arc::new(DecorrelateWhereIn::new()),
             Arc::new(DecorrelateScalarSubquery::new()),

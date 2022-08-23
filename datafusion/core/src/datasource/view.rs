@@ -80,12 +80,15 @@ impl TableProvider for ViewTable {
 
     async fn scan(
         &self,
-        ctx: &SessionState,
+        state: &SessionState,
         _projection: &Option<Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        ctx.create_physical_plan(&self.logical_plan).await
+        // clone state and start_execution so that now() works in views
+        let mut state_cloned = state.clone();
+        state_cloned.execution_props.start_execution();
+        state_cloned.create_physical_plan(&self.logical_plan).await
     }
 }
 
@@ -127,6 +130,72 @@ mod tests {
             "| 1       | 2       | 3       |",
             "| 4       | 5       | 6       |",
             "+---------+---------+---------+",
+        ];
+
+        assert_batches_eq!(expected, &results);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_view_with_alias() -> Result<()> {
+        let session_ctx = SessionContext::with_config(SessionConfig::new());
+
+        session_ctx
+            .sql("CREATE TABLE abc AS VALUES (1,2,3), (4,5,6)")
+            .await?
+            .collect()
+            .await?;
+
+        let view_sql = "CREATE VIEW xyz AS SELECT column1 AS column1_alias, column2 AS column2_alias FROM abc";
+        session_ctx.sql(view_sql).await?.collect().await?;
+
+        let results = session_ctx
+            .sql("SELECT column1_alias FROM xyz")
+            .await?
+            .collect()
+            .await?;
+
+        let expected = vec![
+            "+---------------+",
+            "| column1_alias |",
+            "+---------------+",
+            "| 1             |",
+            "| 4             |",
+            "+---------------+",
+        ];
+
+        assert_batches_eq!(expected, &results);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_view_with_inline_alias() -> Result<()> {
+        let session_ctx = SessionContext::with_config(SessionConfig::new());
+
+        session_ctx
+            .sql("CREATE TABLE abc AS VALUES (1,2,3), (4,5,6)")
+            .await?
+            .collect()
+            .await?;
+
+        let view_sql = "CREATE VIEW xyz (column1_alias, column2_alias) AS SELECT column1, column2 FROM abc";
+        session_ctx.sql(view_sql).await?.collect().await?;
+
+        let results = session_ctx
+            .sql("SELECT column2_alias, column1_alias FROM xyz")
+            .await?
+            .collect()
+            .await?;
+
+        let expected = vec![
+            "+---------------+---------------+",
+            "| column2_alias | column1_alias |",
+            "+---------------+---------------+",
+            "| 2             | 1             |",
+            "| 5             | 4             |",
+            "+---------------+---------------+",
         ];
 
         assert_batches_eq!(expected, &results);
