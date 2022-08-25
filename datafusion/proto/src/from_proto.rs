@@ -890,7 +890,7 @@ pub fn parse_expr(
                     .iter()
                     .map(|e| parse_expr(e, registry))
                     .collect::<Result<Vec<_>, _>>()?,
-                distinct: false, // TODO
+                distinct: expr.distinct,
             })
         }
         ExprType::Alias(alias) => Ok(Expr::Alias(
@@ -1015,7 +1015,10 @@ pub fn parse_expr(
                 ScalarFunction::Sha384 => Ok(sha384(parse_expr(&args[0], registry)?)),
                 ScalarFunction::Sha512 => Ok(sha512(parse_expr(&args[0], registry)?)),
                 ScalarFunction::Md5 => Ok(md5(parse_expr(&args[0], registry)?)),
-                ScalarFunction::NullIf => Ok(nullif(parse_expr(&args[0], registry)?)),
+                ScalarFunction::NullIf => Ok(nullif(
+                    parse_expr(&args[0], registry)?,
+                    parse_expr(&args[1], registry)?,
+                )),
                 ScalarFunction::Digest => Ok(digest(
                     parse_expr(&args[0], registry)?,
                     parse_expr(&args[1], registry)?,
