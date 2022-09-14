@@ -56,7 +56,6 @@ use crate::{
     physical_plan::displayable,
 };
 use arrow::compute::SortOptions;
-use arrow::datatypes::DataType;
 use arrow::datatypes::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion_common::ScalarValue;
@@ -195,7 +194,12 @@ fn create_physical_name(e: &Expr, is_first_expr: bool) -> Result<String> {
             args,
             ..
         } => create_function_physical_name(&fun.to_string(), *distinct, args),
-        Expr::AggregateUDF { fun, args } => {
+        Expr::AggregateUDF { fun, args, filter } => {
+            if filter.is_some() {
+                return Err(DataFusionError::Execution(
+                    "aggregate expression with filter is not supported".to_string(),
+                ));
+            }
             let mut names = Vec::with_capacity(args.len());
             for e in args {
                 names.push(create_physical_name(e, false)?);
@@ -651,17 +655,9 @@ impl DefaultPhysicalPlanner {
                     // update group column indices based on partial aggregate plan evaluation
                     let final_group: Vec<Arc<dyn PhysicalExpr>> = initial_aggr.output_group_expr();
 
-                    // TODO: dictionary type not yet supported in Hash Repartition
-                    let contains_dict = groups
-                        .expr()
-                        .iter()
-                        .flat_map(|x| x.0.data_type(physical_input_schema.as_ref()))
-                        .any(|x| matches!(x, DataType::Dictionary(_, _)));
-
                     let can_repartition = !groups.is_empty()
                         && session_state.config.target_partitions > 1
-                        && session_state.config.repartition_aggregations
-                        && !contains_dict;
+                        && session_state.config.repartition_aggregations;
 
                     let (initial_aggr, next_partition_mode): (
                         Arc<dyn ExecutionPlan>,
@@ -1007,7 +1003,7 @@ impl DefaultPhysicalPlanner {
                         // Apply a LocalLimitExec to each partition. The optimizer will also insert
                         // a CoalescePartitionsExec between the GlobalLimitExec and LocalLimitExec
                         if let Some(fetch) = fetch {
-                            Arc::new(LocalLimitExec::new(input, *fetch + skip.unwrap_or(0)))
+                            Arc::new(LocalLimitExec::new(input, *fetch + skip))
                         } else {
                             input
                         }
@@ -1577,6 +1573,7 @@ impl DefaultPhysicalPlanner {
             if !session_state
                 .config
                 .config_options
+                .read()
                 .get_bool(OPT_EXPLAIN_PHYSICAL_PLAN_ONLY)
             {
                 stringified_plans = e.stringified_plans.clone();
@@ -1587,6 +1584,7 @@ impl DefaultPhysicalPlanner {
             if !session_state
                 .config
                 .config_options
+                .read()
                 .get_bool(OPT_EXPLAIN_LOGICAL_PLAN_ONLY)
             {
                 let input = self
@@ -1664,6 +1662,7 @@ fn tuple_err<T, R>(value: (Result<T>, Result<R>)) -> Result<(T, R)> {
 mod tests {
     use super::*;
     use crate::assert_contains;
+    use crate::datasource::MemTable;
     use crate::execution::context::TaskContext;
     use crate::execution::options::CsvReadOptions;
     use crate::execution::runtime_env::RuntimeEnv;
@@ -1677,7 +1676,9 @@ mod tests {
     use crate::{
         logical_plan::LogicalPlanBuilder, physical_plan::SendableRecordBatchStream,
     };
-    use arrow::datatypes::{DataType, Field, SchemaRef};
+    use arrow::array::{ArrayRef, DictionaryArray, Int32Array};
+    use arrow::datatypes::{DataType, Field, Int32Type, SchemaRef};
+    use arrow::record_batch::RecordBatch;
     use datafusion_common::{DFField, DFSchema, DFSchemaRef};
     use datafusion_expr::expr::GroupingSet;
     use datafusion_expr::sum;
@@ -1710,7 +1711,7 @@ mod tests {
             .project(vec![col("c1"), col("c2")])?
             .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
             .sort(vec![col("c1").sort(true, true)])?
-            .limit(Some(3), Some(10))?
+            .limit(3, Some(10))?
             .build()?;
 
         let plan = plan(&logical_plan).await?;
@@ -1802,7 +1803,7 @@ mod tests {
         let logical_plan = test_csv_scan()
             .await?
             .filter(col("c7").lt(col("c12")))?
-            .limit(Some(3), None)?
+            .limit(3, None)?
             .build()?;
 
         let plan = plan(&logical_plan).await?;
@@ -1812,16 +1813,16 @@ mod tests {
         let _expected = "predicate: BinaryExpr { left: TryCastExpr { expr: Column { name: \"c7\", index: 6 }, cast_type: Float64 }, op: Lt, right: Column { name: \"c12\", index: 11 } }";
         let plan_debug_str = format!("{:?}", plan);
         assert!(plan_debug_str.contains("GlobalLimitExec"));
-        assert!(plan_debug_str.contains("skip: Some(3)"));
+        assert!(plan_debug_str.contains("skip: 3"));
         Ok(())
     }
 
     #[tokio::test]
     async fn test_with_zero_offset_plan() -> Result<()> {
-        let logical_plan = test_csv_scan().await?.limit(Some(0), None)?.build()?;
+        let logical_plan = test_csv_scan().await?.limit(0, None)?.build()?;
         let plan = plan(&logical_plan).await?;
         assert!(format!("{:?}", plan).contains("GlobalLimitExec"));
-        assert!(format!("{:?}", plan).contains("skip: Some(0)"));
+        assert!(format!("{:?}", plan).contains("skip: 0"));
         Ok(())
     }
 
@@ -1830,12 +1831,12 @@ mod tests {
         let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
 
         let logical_plan = scan_empty_with_partitions(Some("test"), &schema, None, 2)?
-            .limit(Some(3), Some(5))?
+            .limit(3, Some(5))?
             .build()?;
         let plan = plan(&logical_plan).await?;
 
         assert!(format!("{:?}", plan).contains("GlobalLimitExec"));
-        assert!(format!("{:?}", plan).contains("skip: Some(3), fetch: Some(5)"));
+        assert!(format!("{:?}", plan).contains("skip: 3, fetch: Some(5)"));
 
         // LocalLimitExec adjusts the `fetch`
         assert!(format!("{:?}", plan).contains("LocalLimitExec"));
@@ -2084,6 +2085,35 @@ mod tests {
         // mode in Aggregate (which is slower)
         assert!(formatted.contains("FinalPartitioned"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hash_agg_group_by_partitioned_on_dicts() -> Result<()> {
+        let dict_array: DictionaryArray<Int32Type> =
+            vec!["A", "B", "A", "A", "C", "A"].into_iter().collect();
+        let val_array: Int32Array = vec![1, 2, 2, 4, 1, 1].into();
+
+        let batch = RecordBatch::try_from_iter(vec![
+            ("d1", Arc::new(dict_array) as ArrayRef),
+            ("d2", Arc::new(val_array) as ArrayRef),
+        ])
+        .unwrap();
+
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+        let ctx = SessionContext::new();
+
+        let logical_plan =
+            LogicalPlanBuilder::from(ctx.read_table(Arc::new(table))?.to_logical_plan()?)
+                .aggregate(vec![col("d1")], vec![sum(col("d2"))])?
+                .build()?;
+
+        let execution_plan = plan(&logical_plan).await?;
+        let formatted = format!("{:?}", execution_plan);
+
+        // Make sure the plan contains a FinalPartitioned, which means it will not use the Final
+        // mode in Aggregate (which is slower)
+        assert!(formatted.contains("FinalPartitioned"));
         Ok(())
     }
 
