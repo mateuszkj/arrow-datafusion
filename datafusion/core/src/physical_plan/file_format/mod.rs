@@ -39,6 +39,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 pub use avro::AvroExec;
+pub use file_stream::{FileOpenFuture, FileOpener, FileStream};
 pub(crate) use json::plan_to_json;
 pub use json::NdJsonExec;
 
@@ -285,8 +286,7 @@ impl SchemaAdapter {
         let projected_schema = Arc::new(self.table_schema.clone().project(projections)?);
 
         // Necessary to handle empty batches
-        let mut options = RecordBatchOptions::default();
-        options.row_count = Some(batch.num_rows());
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
 
         Ok(RecordBatch::try_new_with_options(
             projected_schema,
