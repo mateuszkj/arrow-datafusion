@@ -68,7 +68,7 @@ use parquet::file::{
 };
 use parquet::schema::types::ColumnDescriptor;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 /// Specify options for the parquet scan
 pub struct ParquetScanOptions {
     /// If true, any available `pruning_predicate` will be converted to a `RowFilter`
@@ -78,6 +78,15 @@ pub struct ParquetScanOptions {
     /// If true, the generated `RowFilter` may reorder the predicate `Expr`s to try and optimize
     /// the cost of filter evaluation.
     reorder_predicates: bool,
+}
+
+impl Default for ParquetScanOptions {
+    fn default() -> Self {
+        Self {
+            pushdown_filters: true,
+            reorder_predicates: true,
+        }
+    }
 }
 
 impl ParquetScanOptions {
