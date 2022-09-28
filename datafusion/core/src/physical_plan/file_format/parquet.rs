@@ -91,7 +91,7 @@ impl Default for ParquetScanOptions {
         Self {
             pushdown_filters: true,
             reorder_predicates: true,
-            enable_page_index: true,
+            enable_page_index: false,
         }
     }
 }
