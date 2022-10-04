@@ -90,6 +90,7 @@ pub const UNNAMED_TABLE: &str = "?table?";
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Debug)]
 pub struct LogicalPlanBuilder {
     plan: LogicalPlan,
 }
@@ -780,6 +781,16 @@ impl LogicalPlanBuilder {
         join_type: JoinType,
         is_all: bool,
     ) -> Result<LogicalPlan> {
+        let left_len = left_plan.schema().fields().len();
+        let right_len = right_plan.schema().fields().len();
+
+        if left_len != right_len {
+            return Err(DataFusionError::Plan(format!(
+                "INTERSECT/EXCEPT query must have the same number of columns. Left is {} and right is {}.",
+                left_len, right_len
+            )));
+        }
+
         let join_keys = left_plan
             .schema()
             .fields()
@@ -887,7 +898,19 @@ pub fn union_with_alias(
     right_plan: LogicalPlan,
     alias: Option<String>,
 ) -> Result<LogicalPlan> {
-    let union_schema = (0..left_plan.schema().fields().len())
+    let left_col_num = left_plan.schema().fields().len();
+
+    // the 2 queries should have same number of columns
+    {
+        let right_col_num = right_plan.schema().fields().len();
+        if right_col_num != left_col_num {
+            return Err(DataFusionError::Plan(format!(
+                "Union queries must have the same number of columns, (left is {}, right is {})",
+                left_col_num, right_col_num)
+            ));
+        }
+    }
+    let union_schema = (0..left_col_num)
         .map(|i| {
             let left_field = left_plan.schema().field(i);
             let right_field = right_plan.schema().field(i);
@@ -1186,6 +1209,22 @@ mod tests {
     }
 
     #[test]
+    fn plan_builder_union_different_num_columns_error() -> Result<()> {
+        let plan1 = table_scan(None, &employee_schema(), Some(vec![3]))?;
+
+        let plan2 = table_scan(None, &employee_schema(), Some(vec![3, 4]))?;
+
+        let expected = "Error during planning: Union queries must have the same number of columns, (left is 1, right is 2)";
+        let err_msg1 = plan1.union(plan2.build()?).unwrap_err();
+        let err_msg2 = plan1.union_distinct(plan2.build()?).unwrap_err();
+
+        assert_eq!(err_msg1.to_string(), expected);
+        assert_eq!(err_msg2.to_string(), expected);
+
+        Ok(())
+    }
+
+    #[test]
     fn plan_builder_simple_distinct() -> Result<()> {
         let plan =
             table_scan(Some("employee_csv"), &employee_schema(), Some(vec![0, 3]))?
@@ -1387,5 +1426,22 @@ mod tests {
             Field::new("c", DataType::UInt32, false),
         ]);
         table_scan(Some(name), &schema, None)?.build()
+    }
+
+    #[test]
+    fn plan_builder_intersect_different_num_columns_error() -> Result<()> {
+        let plan1 = table_scan(None, &employee_schema(), Some(vec![3]))?;
+
+        let plan2 = table_scan(None, &employee_schema(), Some(vec![3, 4]))?;
+
+        let expected = "Error during planning: INTERSECT/EXCEPT query must have the same number of columns. \
+         Left is 1 and right is 2.";
+        let err_msg1 =
+            LogicalPlanBuilder::intersect(plan1.build()?, plan2.build()?, true)
+                .unwrap_err();
+
+        assert_eq!(err_msg1.to_string(), expected);
+
+        Ok(())
     }
 }

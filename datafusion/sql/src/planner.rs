@@ -152,6 +152,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 verbose,
                 statement,
                 analyze,
+                format: _,
                 describe_alias: _,
             } => self.explain_statement_to_plan(verbose, analyze, *statement),
             Statement::Query(query) => self.query_to_plan(*query, &mut HashMap::new()),
@@ -364,7 +365,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 }
                 // create logical plan & pass backreferencing CTEs
                 let logical_plan = self.query_to_plan_with_alias(
-                    cte.query,
+                    *cte.query,
                     Some(cte_name.clone()),
                     &mut ctes.clone(),
                     outer_query_schema,
@@ -1720,21 +1721,21 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 ],
             }),
 
-            SQLExpr::Value(Value::Interval {
+            SQLExpr::Array(arr) => self.sql_array_literal(arr.elem, schema),
+
+            SQLExpr::Interval {
                 value,
                 leading_field,
                 leading_precision,
                 last_field,
                 fractional_seconds_precision,
-            }) => self.sql_interval_to_literal(
+            } => self.sql_interval_to_expr(
                 *value,
                 leading_field,
                 leading_precision,
                 last_field,
                 fractional_seconds_precision,
             ),
-
-            SQLExpr::Array(arr) => self.sql_array_literal(arr.elem, schema),
 
             SQLExpr::Identifier(id) => {
                 if id.value.starts_with('@') {
@@ -2325,7 +2326,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         Ok((fun, args))
     }
 
-    fn sql_interval_to_literal(
+    fn sql_interval_to_expr(
         &self,
         value: SQLExpr,
         leading_field: Option<DateTimeField>,
@@ -2697,12 +2698,16 @@ pub fn convert_simple_data_type(sql_type: &SQLDataType) -> Result<DataType> {
         SQLDataType::UnsignedBigInt(_) => Ok(DataType::UInt64),
         SQLDataType::Float(_) => Ok(DataType::Float32),
         SQLDataType::Real => Ok(DataType::Float32),
-        SQLDataType::Double => Ok(DataType::Float64),
+        SQLDataType::Double | SQLDataType::DoublePrecision => Ok(DataType::Float64),
         SQLDataType::Char(_)
         | SQLDataType::Varchar(_)
         | SQLDataType::Text
         | SQLDataType::String => Ok(DataType::Utf8),
         SQLDataType::Timestamp => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        SQLDataType::TimestampTz => Ok(DataType::Timestamp(
+            TimeUnit::Nanosecond,
+            Some("UTC".into()),
+        )),
         SQLDataType::Date => Ok(DataType::Date32),
         SQLDataType::Time => Ok(DataType::Time64(TimeUnit::Nanosecond)),
         SQLDataType::Decimal(precision, scale) => make_decimal_type(*precision, *scale),
@@ -2716,13 +2721,14 @@ pub fn convert_simple_data_type(sql_type: &SQLDataType) -> Result<DataType> {
         | SQLDataType::Varbinary(_)
         | SQLDataType::Blob(_)
         | SQLDataType::Datetime
-        | SQLDataType::TimestampTz
         | SQLDataType::Interval
         | SQLDataType::Regclass
         | SQLDataType::Custom(_)
         | SQLDataType::Array(_)
         | SQLDataType::Enum(_)
         | SQLDataType::Set(_)
+        | SQLDataType::MediumInt(_)
+        | SQLDataType::UnsignedMediumInt(_)
         | SQLDataType::Clob(_) => Err(DataFusionError::NotImplemented(format!(
             "Unsupported SQL type {:?}",
             sql_type
@@ -4400,16 +4406,6 @@ mod tests {
         \n    WindowAggr: windowExpr=[[MIN(#orders.qty) ORDER BY [#orders.order_id DESC NULLS FIRST]]]\
         \n      TableScan: orders";
         quick_test(sql, expected);
-    }
-
-    #[test]
-    fn over_order_by_with_window_frame_range_value_check() {
-        let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY order_id RANGE 3 PRECEDING) from orders";
-        let err = logical_plan(sql).expect_err("query should have failed");
-        assert_eq!(
-            "NotImplemented(\"With WindowFrameUnits=RANGE, the bound cannot be 3 PRECEDING or FOLLOWING at the moment\")",
-            format!("{:?}", err)
-        );
     }
 
     #[test]
