@@ -51,7 +51,7 @@ use crate::utils::{make_decimal_type, normalize_ident, resolve_columns};
 use datafusion_common::{
     field_not_found, Column, DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue,
 };
-use datafusion_expr::expr::GroupingSet;
+use datafusion_expr::expr::{Case, GroupingSet};
 use datafusion_expr::logical_plan::builder::project_with_alias;
 use datafusion_expr::logical_plan::{Filter, Subquery};
 use datafusion_expr::Expr::Alias;
@@ -478,12 +478,20 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             location,
             table_partition_cols,
             if_not_exists,
+            file_compression_type,
         } = statement;
 
         // semantic checks
         if file_type == "PARQUET" && !columns.is_empty() {
             Err(DataFusionError::Plan(
                 "Column definitions can not be specified for PARQUET files.".into(),
+            ))?;
+        }
+
+        if file_type != "CSV" && file_type != "JSON" && !file_compression_type.is_empty()
+        {
+            Err(DataFusionError::Plan(
+                "File compression type can be specified for CSV/JSON files.".into(),
             ))?;
         }
 
@@ -499,6 +507,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             table_partition_cols,
             if_not_exists,
             definition,
+            file_compression_type,
         }))
     }
 
@@ -973,10 +982,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                             x.as_slice(),
                             &[join_columns],
                         )?;
-                        Ok(LogicalPlan::Filter(Filter {
-                            predicate: filter_expr,
-                            input: Arc::new(left),
-                        }))
+                        Ok(LogicalPlan::Filter(Filter::try_new(
+                            filter_expr,
+                            Arc::new(left),
+                        )?))
                     }
                     _ => Ok(left),
                 }
@@ -1872,15 +1881,15 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     None
                 };
 
-                Ok(Expr::Case {
+                Ok(Expr::Case(Case::new(
                     expr,
-                    when_then_expr: when_expr
+                    when_expr
                         .iter()
                         .zip(then_expr.iter())
                         .map(|(w, t)| (Box::new(w.to_owned()), Box::new(t.to_owned())))
                         .collect(),
                     else_expr,
-                })
+                )))
             }
 
             SQLExpr::Cast {
@@ -2853,13 +2862,34 @@ mod tests {
     }
 
     #[test]
-    fn test_int_decimal_scale_larger_precision() {
-        let sql = "SELECT CAST(10 AS DECIMAL(5, 10))";
-        let err = logical_plan(sql).expect_err("query should have failed");
-        assert_eq!(
-            r##"Internal("For decimal(precision, scale) precision must be less than or equal to 38 and scale can't be greater than precision. Got (5, 10)")"##,
-            format!("{:?}", err)
-        );
+    fn cast_to_invalid_decimal_type() {
+        // precision == 0
+        {
+            let sql = "SELECT CAST(10 AS DECIMAL(0))";
+            let err = logical_plan(sql).expect_err("query should have failed");
+            assert_eq!(
+                r##"Internal("Decimal(precision = 0, scale = 0) should satisty `0 < precision <= 38`, and `scale <= precision`.")"##,
+                format!("{:?}", err)
+            );
+        }
+        // precision > 38
+        {
+            let sql = "SELECT CAST(10 AS DECIMAL(39))";
+            let err = logical_plan(sql).expect_err("query should have failed");
+            assert_eq!(
+                r##"Internal("Decimal(precision = 39, scale = 0) should satisty `0 < precision <= 38`, and `scale <= precision`.")"##,
+                format!("{:?}", err)
+            );
+        }
+        // precision < scale
+        {
+            let sql = "SELECT CAST(10 AS DECIMAL(5, 10))";
+            let err = logical_plan(sql).expect_err("query should have failed");
+            assert_eq!(
+                r##"Internal("Decimal(precision = 5, scale = 10) should satisty `0 < precision <= 38`, and `scale <= precision`.")"##,
+                format!("{:?}", err)
+            );
+        }
     }
 
     #[test]
@@ -3996,6 +4026,36 @@ mod tests {
         let sql = "CREATE EXTERNAL TABLE t STORED AS CSV LOCATION 'foo.csv'";
         let expected = "CreateExternalTable: \"t\"";
         quick_test(sql, expected);
+    }
+
+    #[test]
+    fn create_external_table_with_compression_type() {
+        // positive case
+        let sqls = vec![
+            "CREATE EXTERNAL TABLE t(c1 int) STORED AS CSV COMPRESSION TYPE GZIP LOCATION 'foo.csv.gz'",
+            "CREATE EXTERNAL TABLE t(c1 int) STORED AS CSV COMPRESSION TYPE BZIP2 LOCATION 'foo.csv.bz2'",
+            "CREATE EXTERNAL TABLE t(c1 int) STORED AS JSON COMPRESSION TYPE GZIP LOCATION 'foo.json.gz'",
+            "CREATE EXTERNAL TABLE t(c1 int) STORED AS JSON COMPRESSION TYPE BZIP2 LOCATION 'foo.json.bz2'",
+        ];
+        for sql in sqls {
+            let expected = "CreateExternalTable: \"t\"";
+            quick_test(sql, expected);
+        }
+
+        // negative case
+        let sqls = vec![
+            "CREATE EXTERNAL TABLE t STORED AS AVRO COMPRESSION TYPE GZIP LOCATION 'foo.avro'",
+            "CREATE EXTERNAL TABLE t STORED AS AVRO COMPRESSION TYPE BZIP2 LOCATION 'foo.avro'",
+            "CREATE EXTERNAL TABLE t STORED AS PARQUET COMPRESSION TYPE GZIP LOCATION 'foo.parquet'",
+            "CREATE EXTERNAL TABLE t STORED AS PARQUET COMPRESSION TYPE BZIP2 LOCATION 'foo.parquet'",
+        ];
+        for sql in sqls {
+            let err = logical_plan(sql).expect_err("query should have failed");
+            assert_eq!(
+                "Plan(\"File compression type can be specified for CSV/JSON files.\")",
+                format!("{:?}", err)
+            );
+        }
     }
 
     #[test]

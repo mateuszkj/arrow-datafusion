@@ -176,14 +176,7 @@ pub enum Expr {
     ///     [WHEN ...]
     ///     [ELSE result]
     /// END
-    Case {
-        /// Optional base expression that can be compared to literal values in the "when" expressions
-        expr: Option<Box<Expr>>,
-        /// One or more when/then expressions
-        when_then_expr: Vec<(Box<Expr>, Box<Expr>)>,
-        /// Optional "else" expression
-        else_expr: Option<Box<Expr>>,
-    },
+    Case(Case),
     /// Casts the expression to a given type and will return a runtime error if the expression cannot be cast.
     /// This expression is guaranteed to have a fixed type.
     Cast {
@@ -292,6 +285,32 @@ pub enum Expr {
     GroupingSet(GroupingSet),
 }
 
+/// CASE expression
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Case {
+    /// Optional base expression that can be compared to literal values in the "when" expressions
+    pub expr: Option<Box<Expr>>,
+    /// One or more when/then expressions
+    pub when_then_expr: Vec<(Box<Expr>, Box<Expr>)>,
+    /// Optional "else" expression
+    pub else_expr: Option<Box<Expr>>,
+}
+
+impl Case {
+    /// Create a new Case expression
+    pub fn new(
+        expr: Option<Box<Expr>>,
+        when_then_expr: Vec<(Box<Expr>, Box<Expr>)>,
+        else_expr: Option<Box<Expr>>,
+    ) -> Self {
+        Self {
+            expr,
+            when_then_expr,
+            else_expr,
+        }
+    }
+}
+
 /// Grouping sets
 /// See https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-GROUPING-SETS
 /// for Postgres definition.
@@ -348,8 +367,15 @@ impl PartialOrd for Expr {
 impl Expr {
     /// Returns the name of this expression as it should appear in a schema. This name
     /// will not include any CAST expressions.
-    pub fn name(&self) -> Result<String> {
+    pub fn display_name(&self) -> Result<String> {
         create_name(self)
+    }
+
+    /// Returns the name of this expression as it should appear in a schema. This name
+    /// will not include any CAST expressions.
+    #[deprecated(since = "14.0.0", note = "please use `display_name` instead")]
+    pub fn name(&self) -> Result<String> {
+        self.display_name()
     }
 
     /// Returns a full and complete string representation of this expression.
@@ -463,8 +489,16 @@ impl Expr {
     }
 
     /// Return `self AS name` alias expression
-    pub fn alias(self, name: &str) -> Expr {
-        Expr::Alias(Box::new(self), name.to_owned())
+    pub fn alias(self, name: impl Into<String>) -> Expr {
+        Expr::Alias(Box::new(self), name.into())
+    }
+
+    /// Remove an alias from an expression if one exists.
+    pub fn unalias(self) -> Expr {
+        match self {
+            Expr::Alias(expr, _) => expr.as_ref().clone(),
+            _ => self,
+        }
     }
 
     /// Return `self IN <list>` if `negated` is false, otherwise
@@ -601,20 +635,15 @@ impl fmt::Debug for Expr {
             Expr::Column(c) => write!(f, "{}", c),
             Expr::ScalarVariable(_, var_names) => write!(f, "{}", var_names.join(".")),
             Expr::Literal(v) => write!(f, "{:?}", v),
-            Expr::Case {
-                expr,
-                when_then_expr,
-                else_expr,
-                ..
-            } => {
+            Expr::Case(case) => {
                 write!(f, "CASE ")?;
-                if let Some(e) = expr {
+                if let Some(e) = &case.expr {
                     write!(f, "{:?} ", e)?;
                 }
-                for (w, t) in when_then_expr {
+                for (w, t) in &case.when_then_expr {
                     write!(f, "WHEN {:?} THEN {:?} ", w, t)?;
                 }
-                if let Some(e) = else_expr {
+                if let Some(e) = &case.else_expr {
                     write!(f, "ELSE {:?} ", e)?;
                 }
                 write!(f, "END")
@@ -957,22 +986,18 @@ fn create_name(e: &Expr) -> Result<String> {
             );
             Ok(s)
         }
-        Expr::Case {
-            expr,
-            when_then_expr,
-            else_expr,
-        } => {
+        Expr::Case(case) => {
             let mut name = "CASE ".to_string();
-            if let Some(e) = expr {
+            if let Some(e) = &case.expr {
                 let e = create_name(e)?;
                 let _ = write!(name, "{} ", e);
             }
-            for (w, t) in when_then_expr {
+            for (w, t) in &case.when_then_expr {
                 let when = create_name(w)?;
                 let then = create_name(t)?;
                 let _ = write!(name, "WHEN {} THEN {} ", when, then);
             }
-            if let Some(e) = else_expr {
+            if let Some(e) = &case.else_expr {
                 let e = create_name(e)?;
                 let _ = write!(name, "ELSE {} ", e);
             }
@@ -1168,7 +1193,7 @@ mod test {
         assert_eq!(expected, expr.canonical_name());
         assert_eq!(expected, format!("{}", expr));
         assert_eq!(expected, format!("{:?}", expr));
-        assert_eq!(expected, expr.name()?);
+        assert_eq!(expected, expr.display_name()?);
         Ok(())
     }
 
@@ -1184,7 +1209,7 @@ mod test {
         assert_eq!(expected_canonical, format!("{:?}", expr));
         // note that CAST intentionally has a name that is different from its `Display`
         // representation. CAST does not change the name of expressions.
-        assert_eq!("Float32(1.23)", expr.name()?);
+        assert_eq!("Float32(1.23)", expr.display_name()?);
         Ok(())
     }
 
